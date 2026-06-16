@@ -273,7 +273,10 @@ impl InputInjector {
             tilt_x_deg: tilt_x,
             tilt_y_deg: tilt_y,
             tip_down: sample.in_contact,
-            barrel: sample.buttons & 0b001 != 0, // bit 0 = primary barrel
+            // Barrel actions come only from the binding profile, like the
+            // synthetic-pointer path; forwarding the raw bit here also fired
+            // the native HID barrel (right-click) on top of the binding.
+            barrel: false,
             eraser,
             inverted: eraser,
             in_range: sample.in_range,
