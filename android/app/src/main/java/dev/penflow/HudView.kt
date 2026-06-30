@@ -1,9 +1,10 @@
 package dev.penflow
 
 import android.content.Context
-import android.os.SystemClock
+import android.os.Handler
+import android.os.Looper
 import android.util.AttributeSet
-import android.view.Choreographer
+import android.view.View
 import android.widget.TextView
 
 /**
@@ -46,16 +47,33 @@ class HudView @JvmOverloads constructor(
         val oldestSampleAgeNs: Long,
     )
 
-    private val frameCallback = object : Choreographer.FrameCallback {
-        private var lastTickMs = 0L
-        override fun doFrame(frameTimeNanos: Long) {
-            val nowMs = SystemClock.uptimeMillis()
-            if (nowMs - lastTickMs >= 100) {
-                lastTickMs = nowMs
-                refreshText()
-            }
-            Choreographer.getInstance().postFrameCallback(this)
+    // 10 Hz Handler instead of a per-vsync Choreographer callback, ticking only
+    // while the view is shown so a hidden HUD (overlay toggle / screen_off)
+    // stops waking the UI thread entirely.
+    private val refreshHandler = Handler(Looper.getMainLooper())
+    private var ticking = false
+    private val refreshRunnable = object : Runnable {
+        override fun run() {
+            refreshText()
+            refreshHandler.postDelayed(this, REFRESH_INTERVAL_MS)
         }
+    }
+
+    /** Tick only while the view is actually on-screen; idempotent. */
+    private fun updateTicking() {
+        if (isShown) startTicking() else stopTicking()
+    }
+
+    private fun startTicking() {
+        if (ticking) return
+        ticking = true
+        refreshHandler.post(refreshRunnable)
+    }
+
+    private fun stopTicking() {
+        if (!ticking) return
+        ticking = false
+        refreshHandler.removeCallbacks(refreshRunnable)
     }
 
     init {
@@ -69,12 +87,24 @@ class HudView @JvmOverloads constructor(
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        Choreographer.getInstance().postFrameCallback(frameCallback)
+        updateTicking()
     }
 
     override fun onDetachedFromWindow() {
-        Choreographer.getInstance().removeFrameCallback(frameCallback)
+        stopTicking()
         super.onDetachedFromWindow()
+    }
+
+    // Visibility changes (overlay toggle / screen_off) gate the loop here.
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        updateTicking()
+    }
+
+    // Fires when the activity moves to / from the background.
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        updateTicking()
     }
 
     /**
@@ -209,5 +239,10 @@ class HudView @JvmOverloads constructor(
         if (sorted.isEmpty()) return 0
         val idx = ((sorted.size - 1) * 0.99).toInt()
         return sorted[idx]
+    }
+
+    companion object {
+        /** HUD refresh cadence; 10 Hz is plenty to read. */
+        private const val REFRESH_INTERVAL_MS = 100L
     }
 }
