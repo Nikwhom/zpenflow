@@ -46,7 +46,8 @@ use penflow_transport::{Transport, TransportStream};
 
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
 };
 
 use crate::vdd::{
@@ -1027,20 +1028,29 @@ async fn read_loop<R: AsyncRead + Unpin>(
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
 
-    // Virtual-screen dimensions. Used to convert VMulti's normalized
-    // [0,1] tablet coords onto its logical-axis [0, 32767] range scaled
-    // across the full desktop. Captured once per session — monitor
-    // topology changes are rare and would require a session restart for
-    // the rest of the engine anyway.
+    // Virtual-screen origin and dimensions. Used to convert VMulti's
+    // normalized [0,1] tablet coords onto its logical-axis [0, 32767]
+    // range scaled across the full desktop. Captured once per session —
+    // monitor topology changes are rare and would require a session
+    // restart for the rest of the engine anyway.
+    //
+    // The origin is not always (0, 0): `SM_X/YVIRTUALSCREEN` go negative
+    // whenever a monitor sits left of or above the primary. `coords` emits
+    // desktop-space pixels (origin = primary top-left), so they must be
+    // rebased onto the virtual-screen origin before scaling, exactly as
+    // the win_ink path does via `virtual_screen_origin()`. Without this the
+    // pen maps across the whole desktop instead of onto its own monitor.
     #[cfg(windows)]
-    let (vscreen_w, vscreen_h) = unsafe {
+    let (vscreen_x, vscreen_y, vscreen_w, vscreen_h) = unsafe {
         (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
             GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as u32,
             GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as u32,
         )
     };
     #[cfg(not(windows))]
-    let (vscreen_w, vscreen_h) = (1u32, 1u32);
+    let (vscreen_x, vscreen_y, vscreen_w, vscreen_h) = (0i32, 0i32, 1u32, 1u32);
     loop {
         let (msg_id, payload) = match read_frame(&mut reader).await {
             Ok(v) => v,
@@ -1062,8 +1072,9 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 // VMulti logical coords, scaled across the virtual screen.
                 // The Win32 / WinRT fallback path ignores these; the
                 // VMulti path uses them and ignores the i32 pixels above.
-                let (vx_log, vy_log) =
-                    coords.map_to_vmulti(pe.x_norm, pe.y_norm, vscreen_w, vscreen_h);
+                let (vx_log, vy_log) = coords.map_to_vmulti(
+                    pe.x_norm, pe.y_norm, vscreen_x, vscreen_y, vscreen_w, vscreen_h,
+                );
                 let sample = PenSample {
                     x,
                     y,
