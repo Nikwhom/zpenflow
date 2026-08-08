@@ -178,10 +178,15 @@ pub struct SessionConfig {
 /// coordinates plus raw and curve-shaped pressure.
 #[derive(Clone, Copy, Debug)]
 pub struct PenFeel {
+    /// Normalized `[0, 1]` X on the tablet panel.
     pub x: f32,
+    /// Normalized `[0, 1]` Y on the tablet panel.
     pub y: f32,
+    /// Raw pressure as reported by the pen, `[0, 1]`.
     pub raw: f32,
+    /// Pressure after the response curve, `[0, 1]` — what gets injected.
     pub curved: f32,
+    /// True while the (curved) sample counts as tip contact.
     pub contact: bool,
 }
 
