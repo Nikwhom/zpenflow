@@ -636,6 +636,7 @@ impl Session {
             idr_tx,
             session_start,
             self.cfg.disable_touch,
+            engine.activity(),
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
@@ -841,6 +842,9 @@ impl Session {
             idr_tx,
             session_start,
             self.cfg.disable_touch,
+            // No engine on this path, so nothing consumes the signal; a
+            // fresh tracker keeps the read_loop signature uniform.
+            Arc::new(penflow_core::idle::ActivityTracker::new()),
         );
         let finish_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match finish {
             Some(rx) => Box::pin(async move {
@@ -1025,6 +1029,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
     idr_tx: tokio::sync::mpsc::UnboundedSender<()>,
     session_start: Instant,
     disable_touch: bool,
+    activity: Arc<penflow_core::idle::ActivityTracker>,
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
 
@@ -1067,6 +1072,9 @@ async fn read_loop<R: AsyncRead + Unpin>(
 
         match msg_id {
             MSG_PEN_EVENT => {
+                // Feed the idle governor: any pen traffic (hover included)
+                // keeps or restores the full frame rate.
+                activity.touch();
                 let pe = PenEvent::decode(&payload)?;
                 let (x, y) = coords.map_to_pixel(pe.x_norm, pe.y_norm);
                 // VMulti logical coords, scaled across the virtual screen.
@@ -1095,6 +1103,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 }
             }
             MSG_TOUCH_EVENT => {
+                activity.touch();
                 let te = TouchEvent::decode(&payload)?;
                 if disable_touch {
                     // Release any fingers that were touching the tablet
