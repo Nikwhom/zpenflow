@@ -165,6 +165,24 @@ pub struct SessionConfig {
     /// in `service.rs::build_session_config` so the saved bindings
     /// actually reach the synthetic-pointer layer (issue #6).
     pub pen_profile: penflow_core::inject::binding::PenButtonProfile,
+    /// Pen pressure response curve, applied where `PenSample` is built so
+    /// both injection backends see the identical reshaped pressure.
+    pub pressure: penflow_core::inject::pressure::PressureCurve,
+    /// Optional live feed of (raw, curved) pen samples for the GUI's
+    /// "pen feel" test pad. `send` on a receiver-less channel is a cheap
+    /// no-op, so this costs nothing when the settings page is closed.
+    pub pen_feed: Option<tokio::sync::broadcast::Sender<PenFeel>>,
+}
+
+/// One pen sample as exposed to the GUI test pad: normalized tablet
+/// coordinates plus raw and curve-shaped pressure.
+#[derive(Clone, Copy, Debug)]
+pub struct PenFeel {
+    pub x: f32,
+    pub y: f32,
+    pub raw: f32,
+    pub curved: f32,
+    pub contact: bool,
 }
 
 impl Default for SessionConfig {
@@ -219,6 +237,8 @@ impl Default for SessionConfig {
             screen_off: false,
             disable_touch: false,
             pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
+            pressure: penflow_core::inject::pressure::PressureCurve::default(),
+            pen_feed: None,
         }
     }
 }
@@ -637,6 +657,8 @@ impl Session {
             session_start,
             self.cfg.disable_touch,
             engine.activity(),
+            self.cfg.pressure,
+            self.cfg.pen_feed.clone(),
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
@@ -845,6 +867,8 @@ impl Session {
             // No engine on this path, so nothing consumes the signal; a
             // fresh tracker keeps the read_loop signature uniform.
             Arc::new(penflow_core::idle::ActivityTracker::new()),
+            self.cfg.pressure,
+            self.cfg.pen_feed.clone(),
         );
         let finish_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match finish {
             Some(rx) => Box::pin(async move {
@@ -1030,6 +1054,8 @@ async fn read_loop<R: AsyncRead + Unpin>(
     session_start: Instant,
     disable_touch: bool,
     activity: Arc<penflow_core::idle::ActivityTracker>,
+    pressure: penflow_core::inject::pressure::PressureCurve,
+    pen_feed: Option<tokio::sync::broadcast::Sender<PenFeel>>,
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
 
@@ -1083,16 +1109,30 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 let (vx_log, vy_log) = coords.map_to_vmulti(
                     pe.x_norm, pe.y_norm, vscreen_x, vscreen_y, vscreen_w, vscreen_h,
                 );
+                // Pressure curve. When it outputs 0 on a physical contact
+                // (below the click threshold) the sample is demoted to
+                // hover — that is the Wacom click-threshold contract.
+                let curved = pressure.apply(pe.pressure);
+                let in_contact = matches!(pe.phase, 1 | 2) && curved > 0.0;
+                if let Some(feed) = &pen_feed {
+                    let _ = feed.send(PenFeel {
+                        x: pe.x_norm,
+                        y: pe.y_norm,
+                        raw: pe.pressure,
+                        curved,
+                        contact: in_contact,
+                    });
+                }
                 let sample = PenSample {
                     x,
                     y,
                     x_logical: vx_log,
                     y_logical: vy_log,
-                    pressure: pe.pressure,
+                    pressure: curved,
                     tilt_x_deg: pe.tilt_x as i32,
                     tilt_y_deg: pe.tilt_y as i32,
-                    in_range: pe.phase != 4,               // 4 = leave
-                    in_contact: matches!(pe.phase, 1 | 2), // down or move
+                    in_range: pe.phase != 4, // 4 = leave
+                    in_contact,
                     eraser: pe.tool == 1,
                     buttons: pe.buttons,
                     captured_at: None,
