@@ -39,6 +39,10 @@ class MainActivity : Activity() {
     @Volatile
     private var screenOff: Boolean = false
 
+    /** True while the client state is Connected. Drives the keep-screen-on
+     *  window flag together with [screenOff]. */
+    private var sessionActive: Boolean = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -115,6 +119,7 @@ class MainActivity : Activity() {
                     // Screen-off: hide the video surface and dim the panel
                     // (no video will arrive). Pen + touch input still flow.
                     screenOff = cfg.screenOff
+                    updateKeepScreenOn()
                     surfaceView.visibility =
                         if (cfg.screenOff) android.view.View.GONE
                         else android.view.View.VISIBLE
@@ -155,6 +160,8 @@ class MainActivity : Activity() {
     }
 
     private fun renderState(st: PenflowClient.State) {
+        sessionActive = st is PenflowClient.State.Connected
+        updateKeepScreenOn()
         statusView.text = when (st) {
             PenflowClient.State.Disconnected -> "disconnected"
             PenflowClient.State.Connecting -> "connecting…"
@@ -176,6 +183,30 @@ class MainActivity : Activity() {
     }
 
     /** Per-window brightness override; no WRITE_SETTINGS needed. */
+    /**
+     * Keep the panel awake ONLY while a session is live and actually
+     * showing video. An earlier unconditional FLAG_KEEP_SCREEN_ON in
+     * onCreate was removed (93ea1d2) because it pinned the screen awake
+     * for the whole app lifetime — including while sitting disconnected
+     * and in screen-off pen-tablet mode, whose entire purpose is letting
+     * the panel rest. Scoping the flag to (Connected && !screenOff)
+     * keeps that fix intact while stopping the display timeout from
+     * blanking the tablet mid-session: a pen display that dozes off
+     * between strokes is not usable as a display.
+     *
+     * A window flag needs no permissions and cannot leak: the flag dies
+     * with the window, and every path out of Connected (disconnect,
+     * error, reconnect) lands in renderState which clears it.
+     */
+    private fun updateKeepScreenOn() {
+        val keep = sessionActive && !screenOff
+        if (keep) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
     private fun applyScreenBrightness(dim: Boolean) {
         val lp = window.attributes
         val target = if (dim) {
