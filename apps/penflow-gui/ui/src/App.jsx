@@ -109,7 +109,27 @@ function PenFeelCard({ styles, pressure, onChange }) {
         const un = listen("pen-feel", (ev) => {
             const s = ev.payload;
             if (!s.contact) { lastPtRef.current = null; return; }
-            const pt = { x: s.x * canvas.width, y: s.y * canvas.height, w: 0.5 + s.curved * 12 };
+            // Wacom-style "Try Here": only strokes that physically land
+            // inside this canvas's on-screen frame are drawn. The sample
+            // carries its mapped desktop-pixel position; compare it to the
+            // canvas's own desktop rect (window position + element rect,
+            // scaled to physical pixels). Put this settings window on the
+            // tablet's display and draw directly in the box.
+            const dpr = window.devicePixelRatio || 1;
+            const r = canvas.getBoundingClientRect();
+            const left = (window.screenX + r.left) * dpr;
+            const top = (window.screenY + r.top) * dpr;
+            const w = r.width * dpr;
+            const h = r.height * dpr;
+            if (s.x_px < left || s.x_px > left + w || s.y_px < top || s.y_px > top + h) {
+                lastPtRef.current = null; // stroke left the frame
+                return;
+            }
+            const pt = {
+                x: ((s.x_px - left) / w) * canvas.width,
+                y: ((s.y_px - top) / h) * canvas.height,
+                w: 0.5 + s.curved * 12,
+            };
             const last = lastPtRef.current;
             if (last) {
                 ctx.strokeStyle = "#3b6df0";
@@ -139,7 +159,9 @@ function PenFeelCard({ styles, pressure, onChange }) {
             <Subtitle2 className={styles.cardTitle}>Pen feel</Subtitle2>
             <Caption1 className={styles.hint}>
                 Drag the handles: ▲ click threshold, ▼ max pressure, ■ sensitivity.
-                Then draw anywhere on the tablet — the pad shows the curved response live.
+                Move this window onto the tablet's display and draw INSIDE the
+                dark box — only strokes inside the frame are tracked, at the
+                curved pressure.
             </Caption1>
             <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "flex-start" }}>
                 <svg

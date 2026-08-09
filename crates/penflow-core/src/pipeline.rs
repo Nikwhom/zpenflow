@@ -481,6 +481,19 @@ impl LoopState {
                     }
                 }
                 if let Some(pos) = frame.pointer_position() {
+                    // A cursor that moved means a human is driving this
+                    // display with the MOUSE — the idle governor must not
+                    // throttle under them. Pen/touch already feed the
+                    // tracker from the session's read loop; this covers the
+                    // remaining input device. Video playback doesn't move
+                    // the cursor, so passive watching still idles down.
+                    let moved = match self.last_pointer {
+                        Some(prev) => prev.x != pos.x || prev.y != pos.y,
+                        None => true,
+                    };
+                    if moved {
+                        self.activity.touch();
+                    }
                     self.last_pointer = Some(pos);
                 }
                 drop(frame);

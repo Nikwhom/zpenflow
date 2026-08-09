@@ -438,6 +438,8 @@ fn main() -> std::process::ExitCode {
                     raw: f32,
                     curved: f32,
                     contact: bool,
+                    x_px: i32,
+                    y_px: i32,
                 }
                 let pen_service = Arc::clone(&service);
                 let pen_handle = app.handle().clone();
@@ -462,6 +464,8 @@ fn main() -> std::process::ExitCode {
                                         raw: s.raw,
                                         curved: s.curved,
                                         contact: s.contact,
+                                        x_px: s.x_px,
+                                        y_px: s.y_px,
                                     },
                                 );
                             }

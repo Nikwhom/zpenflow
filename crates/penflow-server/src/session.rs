@@ -188,6 +188,12 @@ pub struct PenFeel {
     pub curved: f32,
     /// True while the (curved) sample counts as tip contact.
     pub contact: bool,
+    /// Mapped desktop-space X in physical pixels — where this sample lands
+    /// on the PC desktop. Lets the GUI's test pad accept only strokes that
+    /// physically fall inside its own on-screen frame.
+    pub x_px: i32,
+    /// Mapped desktop-space Y in physical pixels.
+    pub y_px: i32,
 }
 
 impl Default for SessionConfig {
@@ -1126,6 +1132,8 @@ async fn read_loop<R: AsyncRead + Unpin>(
                         raw: pe.pressure,
                         curved,
                         contact: in_contact,
+                        x_px: x,
+                        y_px: y,
                     });
                 }
                 let sample = PenSample {
