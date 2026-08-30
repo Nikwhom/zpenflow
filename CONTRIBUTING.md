@@ -26,6 +26,33 @@ cargo tauri dev
 
 A window titled "Penflow" opens. Engine wiring is in progress — see [`docs/design.md`](docs/design.md) for the plan.
 
+## Testing a local build against an existing install
+
+If Penflow is also **installed** (`C:\Program Files\Penflow\penflow-gui.exe`),
+double-clicking your freshly built `target\release\penflow-gui.exe` does not
+run your build. With `run_as_admin: true` in
+`%APPDATA%\Penflow\settings.json`, `main.rs` hands off to the scheduled task
+`Penflow` — which is registered to the **installed** exe — and then exits. The
+installed release keeps running and your fix appears to do nothing.
+
+Launch from an elevated shell instead; `is_elevated()` is already true, so
+there is no handoff:
+
+```powershell
+# quit the running instance first (tray -> Quit; that also disables the VDD)
+& 'C:\path\to\zpenflow\target\release\penflow-gui.exe'
+```
+
+Verify which binary is live before trusting a measurement — a running exe is
+file-locked, and `Win32_Process.ExecutablePath` comes back empty for an
+elevated process queried from an unelevated shell:
+
+```powershell
+$p = 'C:\path\to\zpenflow\target\release\penflow-gui.exe'
+try { [IO.File]::Open($p,'Open','Write','None').Close(); 'not running' }
+catch { 'this build IS running' }
+```
+
 ## Tests + lints (must pass before pushing)
 
 ```powershell

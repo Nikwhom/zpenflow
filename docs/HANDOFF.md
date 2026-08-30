@@ -362,6 +362,39 @@ The predecessor `main` branch proves manual install + stable capture through Vir
 
 This is Wave 5 work, not Wave 2. Don't engineer it now; just don't accidentally lock yourself out.
 
+### 4.7 The capture loop must pace itself
+
+`LoopState::run` (`penflow-core/src/pipeline.rs`) used to sleep only in the
+idle-governor branch. While active its rate was whatever `acquire_frame`
+returned at — and that is **not** a frame rate. DDA wakes on pointer events
+as well as content changes, so a mouse moving over the VDD output produced
+~2900 wake-ups/second (measured, `examples/cursor_probe`), each one running a
+full-frame copy + cursor blit + NV12 convert + encoder submit. Latency grew
+the longer the mouse moved. Pen input never triggered it, which made it look
+like a cursor bug for a long time. A static desktop hides the whole thing:
+there the 16 ms acquire timeout paces the loop to 60 fps by accident.
+
+Rule: anything driving the encoder gets an explicit period
+(`pace_sleep_ms`). Never let an OS event source set your frame rate.
+
+Corollary for diagnosis: `is_cursor_only()` / `LastPresentTime == 0`
+separates "DDA has new pixels" from "DDA just woke up". Most wake-ups carry
+nothing at all — no new image, no pointer move, no shape change — and should
+be dropped before any GPU work.
+
+### 4.8 vdd_settings.xml comes back ReadOnly after a driver reinstall
+
+Reinstalling the VDD rewrites `C:\VirtualDisplayDriver\vdd_settings.xml` with
+the installer's defaults **and sets the ReadOnly attribute**. The ACL still
+grants Modify, so this looks writable, but `std::fs::write` fails
+access-denied. Every settings push the service makes before an enable then
+silently no-ops and the driver keeps the installer's config — including
+`HardwareCursor=false`, which puts the OS software cursor back into the VDD
+framebuffer. `settings.rs::clear_readonly` handles it; failures are logged to
+`%APPDATA%\Penflow\debug.log`, not just stderr.
+
+Full writeup of both, with the probe numbers: [`vdd-stuck.md`](vdd-stuck.md).
+
 ---
 
 ## 5. Forward plan
