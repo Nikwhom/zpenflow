@@ -11,8 +11,8 @@ android {
         applicationId 'dev.penflow'
         minSdk 28        // Android 9; MediaCodec async + InputDevice features
         targetSdk 34
-        versionCode 5
-        versionName '0.1.4'
+        versionCode 6
+        versionName '0.1.5'
     }
 
     buildTypes {
