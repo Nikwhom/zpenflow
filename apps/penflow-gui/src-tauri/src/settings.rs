@@ -359,7 +359,36 @@ pub fn write_vdd_settings_file(
         }
     }
     let xml = render_vdd_settings_xml(s.vdd_resolution, &s.preferred_gpu);
+    clear_readonly(path)?;
     std::fs::write(path, xml)
+}
+
+/// Drop the ReadOnly attribute so the write below can land.
+///
+/// Why this exists: reinstalling the VDD (Virtual Display Control's
+/// installer, or the driver regenerating its own defaults) leaves
+/// `C:\VirtualDisplayDriver\vdd_settings.xml` marked ReadOnly. Our ACL is
+/// fine — `Authenticated Users` has Modify — but `std::fs::write` on a
+/// ReadOnly file still fails with access-denied, so every settings push
+/// silently no-opped and the driver kept running the installer's defaults.
+/// That includes `HardwareCursor=false`, which puts the OS software cursor
+/// back into the VDD framebuffer and makes the pointer feel laggy on the
+/// tablet (an extra DWM compose + present before the move can reach DDA).
+///
+/// Missing file is not an error: the write creates it.
+fn clear_readonly(path: &std::path::Path) -> std::io::Result<()> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut perms = meta.permissions();
+    if perms.readonly() {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }
 
 /// Minimal XML text escaping for the GPU friendly name. Adapter names are
@@ -468,9 +497,7 @@ mod tests {
             DisplayResolution::default(),
             "NVIDIA GeForce RTX 5080 Laptop GPU",
         );
-        assert!(xml.contains(
-            "<friendlyname>NVIDIA GeForce RTX 5080 Laptop GPU</friendlyname>"
-        ));
+        assert!(xml.contains("<friendlyname>NVIDIA GeForce RTX 5080 Laptop GPU</friendlyname>"));
     }
 
     #[test]
@@ -483,6 +510,44 @@ mod tests {
     fn vdd_xml_whitespace_gpu_is_default() {
         let xml = render_vdd_settings_xml(DisplayResolution::default(), "   ");
         assert!(xml.contains("<friendlyname>default</friendlyname>"));
+    }
+
+    #[test]
+    fn vdd_xml_keeps_hardware_cursor_on() {
+        // HardwareCursor=false hands the cursor back to the OS software
+        // compositor on the VDD output, which is what makes the pointer
+        // feel laggy on the tablet. The driver's own installer default is
+        // false, so ours must stay explicitly true.
+        let xml = render_vdd_settings_xml(DisplayResolution::default(), "");
+        assert!(xml.contains("<HardwareCursor>true</HardwareCursor>"));
+    }
+
+    #[test]
+    fn settings_write_overwrites_a_readonly_file() {
+        // A VDD reinstall leaves vdd_settings.xml ReadOnly; without the
+        // attribute clear, every settings push fails access-denied and the
+        // driver silently keeps the installer's config.
+        let path = std::env::temp_dir().join(format!(
+            "penflow_vdd_settings_ro_{}_{}.xml",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "stale").expect("seed file");
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).expect("mark read-only");
+
+        let res = write_vdd_settings_file(&path, &Settings::default(), false);
+
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(&path, perms);
+        let _ = std::fs::remove_file(&path);
+
+        res.expect("write should succeed over a read-only file");
+        assert!(written.contains("<HardwareCursor>true</HardwareCursor>"));
     }
 
     #[test]

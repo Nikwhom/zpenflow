@@ -462,7 +462,17 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
                 "[service] VDD settings updated: {}x{}",
                 s.vdd_resolution.width, s.vdd_resolution.height
             ),
-            Err(e) => eprintln!("[service] VDD settings update failed: {e}"),
+            Err(e) => {
+                // Not cosmetic: a stale vdd_settings.xml keeps the driver on
+                // the installer's defaults, including HardwareCursor=false
+                // (laggy pointer on the tablet). stderr alone is invisible in
+                // a released build, so this one goes to the debug log.
+                eprintln!("[service] VDD settings update failed: {e}");
+                log_diagnostic(&format!(
+                    "VDD settings update failed for {}: {e} — driver keeps its                      previous config (check the file's ReadOnly attribute)",
+                    settings::installed_vdd_settings_path().display()
+                ));
+            }
         }
     }
 
