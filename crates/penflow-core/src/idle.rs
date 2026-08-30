@@ -19,10 +19,26 @@
 //! Wake-up latency is bounded by one idle frame period (33 ms at 30 fps).
 //! EMR pens report hover well before the tip lands, and hovering generates
 //! a continuous event stream, so the session is back at full rate before
-//! the first stroke starts.
+//! the first stroke starts. The mouse has no hover to announce itself with,
+//! so the pipeline runs a dedicated cursor watcher
+//! (`pipeline::spawn_cursor_watcher`) that feeds this tracker directly
+//! rather than waiting to sample the cursor inside a throttled tick.
+//!
+//! **Why the idle window is long.** Dropping the delivered rate is not free
+//! on the client: `VideoDecoder.kt` pins the tablet panel with
+//! `setFrameRate(fps, FIXED_SOURCE, CHANGE_FRAME_RATE_ALWAYS)` precisely
+//! because the panel's VRR/ARR controller downclocks when the system looks
+//! idle — and once it has, the BufferQueue back-pressures, the codec
+//! callback stalls in `releaseOutputBuffer`, and decode latency ratchets up
+//! for *seconds* after traffic resumes. Feeding that panel a rate below the
+//! hint is what triggers exactly the state the hint exists to prevent. So
+//! the governor must only engage when the user is genuinely away, never
+//! during the pauses a drawing session is made of: 90 s, not 10 s. The
+//! saving is unchanged for a tablet left alone; the multi-second wake stall
+//! at every think-pause is gone.
 //!
 //! Config via env (read once at engine build):
-//!   PENFLOW_IDLE_AFTER_MS  default 10000; 0 disables idling entirely.
+//!   PENFLOW_IDLE_AFTER_MS  default 90000; 0 disables idling entirely.
 //!   PENFLOW_IDLE_FPS       default 30;    0 disables idling entirely.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,7 +92,10 @@ pub struct IdleConfig {
 }
 
 impl IdleConfig {
-    pub const DEFAULT_AFTER_MS: u64 = 10_000;
+    /// Input silence before throttling. Long on purpose — see the module
+    /// docs: a shorter window costs a multi-second client-side stall on
+    /// every wake, which is far worse than the power it saves.
+    pub const DEFAULT_AFTER_MS: u64 = 90_000;
     pub const DEFAULT_FPS: u32 = 30;
 
     pub fn disabled() -> Self {

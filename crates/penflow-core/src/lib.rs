@@ -323,6 +323,10 @@ impl EngineBuilder {
                 pts_epoch: self.pts_epoch.unwrap_or_else(Instant::now),
                 scrgb_sdr_scale,
                 idle: idle_cfg,
+                // Scopes the cursor watcher's wake to this output: moving
+                // the mouse around the laptop's own screen must not hold
+                // the tablet session at full rate.
+                capture_rect: Some(monitor.desktop_coords),
             },
             activity.clone(),
         )?;

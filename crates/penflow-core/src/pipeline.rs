@@ -23,11 +23,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows::core::w;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, POINT};
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, GetCurrentThread,
     SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+/// How often the cursor watcher samples `GetCursorPos`. Half an idle frame
+/// period at 30 fps, so a mouse move is seen before the throttled loop
+/// could have sampled it, and cheap enough (one syscall) that running it
+/// through an idle session costs nothing measurable.
+const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 use crate::capture::dxgi::{DxgiCapturer, PointerPosition};
 use crate::color::{clear_bgra_texture_to_black, create_bgra_keepalive_texture, ColorConverter};
@@ -110,6 +117,12 @@ pub struct PipelineConfig {
     /// Idle-governor tunables (see `crate::idle`). `IdleConfig::disabled()`
     /// preserves the exact pre-governor behaviour.
     pub idle: crate::idle::IdleConfig,
+    /// Virtual-desktop rect of the captured output, `(left, top, right,
+    /// bottom)` — `MonitorInfo::desktop_coords`. Used only by the cursor
+    /// watcher, to decide whether a cursor movement is happening *on this
+    /// display*. `None` means "count any movement anywhere", which is the
+    /// safe fallback: it can only keep the session awake, never stall it.
+    pub capture_rect: Option<(i32, i32, i32, i32)>,
 }
 
 impl Default for PipelineConfig {
@@ -127,6 +140,7 @@ impl Default for PipelineConfig {
             pts_epoch: Instant::now(),
             scrgb_sdr_scale: 1.0,
             idle: crate::idle::IdleConfig::disabled(),
+            capture_rect: None,
         }
     }
 }
@@ -137,6 +151,9 @@ pub struct Pipeline {
     idr_request: Arc<AtomicBool>,
     keepalive_uses: Arc<AtomicU64>,
     handle: Option<JoinHandle<EngineResult<()>>>,
+    /// Cursor watcher (see `spawn_cursor_watcher`). `None` when the idle
+    /// governor is disabled — with no throttling there is nothing to wake.
+    cursor_handle: Option<JoinHandle<()>>,
 }
 
 impl Pipeline {
@@ -216,6 +233,18 @@ impl Pipeline {
             }
         };
 
+        // Mouse wake. The encode loop can only notice cursor movement on a
+        // tick, from DDA's `LastMouseUpdateTime` — but while throttled it
+        // ticks at the idle rate, so the mouse was sampled at exactly the
+        // rate the mouse is supposed to lift us out of. Pen and touch never
+        // had this problem: the session's read loop touches the tracker per
+        // event. This thread gives the mouse the same event-driven wake.
+        let cursor_handle = if cfg.idle.enabled() {
+            spawn_cursor_watcher(Arc::clone(&activity), Arc::clone(&stop), cfg.capture_rect)
+        } else {
+            None
+        };
+
         let q = Arc::clone(&queue);
         let s = Arc::clone(&stop);
         let idr = Arc::clone(&idr_request);
@@ -253,6 +282,7 @@ impl Pipeline {
                     activity,
                     has_real_frame: false,
                     nv12_valid: false,
+                    was_idle: false,
                     start_instant: pts_epoch,
                     last_dda_format: None,
                 };
@@ -266,6 +296,7 @@ impl Pipeline {
             idr_request,
             keepalive_uses,
             handle: Some(handle),
+            cursor_handle,
         })
     }
 
@@ -289,6 +320,9 @@ impl Pipeline {
     pub fn stop(mut self) -> EngineResult<()> {
         self.stop.store(true, Ordering::Release);
         self.queue.close();
+        if let Some(h) = self.cursor_handle.take() {
+            let _ = h.join();
+        }
         if let Some(h) = self.handle.take() {
             match h.join() {
                 Ok(r) => r,
@@ -304,9 +338,68 @@ impl Drop for Pipeline {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.queue.close();
+        if let Some(h) = self.cursor_handle.take() {
+            let _ = h.join();
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Poll the OS cursor and feed the idle governor when it moves.
+///
+/// Runs only while the governor is enabled. The cost is one `GetCursorPos`
+/// every [`CURSOR_POLL_INTERVAL`]; it reads no GPU state and takes no lock,
+/// so it is safe to run beside the TIME_CRITICAL encode thread.
+///
+/// `capture_rect` scopes what counts as activity to the captured output. A
+/// user working on the laptop's own screen moves the cursor constantly, and
+/// without the bounds check that traffic would pin the tablet session at
+/// full rate forever — the exact power waste the governor exists to stop.
+/// `None` disables the check (count movement anywhere), which errs toward
+/// staying awake.
+fn spawn_cursor_watcher(
+    activity: Arc<crate::idle::ActivityTracker>,
+    stop: Arc<AtomicBool>,
+    capture_rect: Option<(i32, i32, i32, i32)>,
+) -> Option<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("penflow-cursor".into())
+        .spawn(move || {
+            let mut last: Option<POINT> = None;
+            while !stop.load(Ordering::Acquire) {
+                let mut pt = POINT::default();
+                // SAFETY: `GetCursorPos` writes one POINT through the out
+                // pointer and touches nothing else. A failure (locked
+                // session, secure desktop) just leaves `pt` untouched and
+                // we skip this sample.
+                if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+                    let moved = match last {
+                        Some(prev) => prev.x != pt.x || prev.y != pt.y,
+                        // First sample establishes a baseline; it is a
+                        // reading, not a movement.
+                        None => false,
+                    };
+                    if moved && point_in_rect(pt, capture_rect) {
+                        activity.touch();
+                    }
+                    last = Some(pt);
+                }
+                thread::sleep(CURSOR_POLL_INTERVAL);
+            }
+        })
+        .ok()
+}
+
+/// `true` when `pt` lies inside `rect`, or when there is no rect to test
+/// against. Rect is `(left, top, right, bottom)` in virtual-desktop
+/// coordinates, right/bottom exclusive — the Win32 convention
+/// `MonitorInfo::desktop_coords` already follows.
+fn point_in_rect(pt: POINT, rect: Option<(i32, i32, i32, i32)>) -> bool {
+    match rect {
+        None => true,
+        Some((l, t, r, b)) => pt.x >= l && pt.x < r && pt.y >= t && pt.y < b,
     }
 }
 
@@ -342,6 +435,11 @@ struct LoopState {
     /// keepalive re-encode with this set can skip the BGRA→NV12 shader
     /// pass entirely and feed the encoder the previous conversion.
     nv12_valid: bool,
+    /// Whether the previous iteration was inside the idle window. Only used
+    /// to spot the idle -> active edge, which forces one IDR so a client
+    /// that shed frames during the low-rate stretch re-anchors immediately
+    /// instead of waiting out the encoder's own keyframe interval.
+    was_idle: bool,
     start_instant: Instant,
     /// Last DDA format we logged the routing decision for. Lets us emit
     /// one log line per format transition (HDR toggled, monitor swap)
@@ -353,6 +451,16 @@ impl LoopState {
     fn run(&mut self) -> EngineResult<()> {
         while !self.stop.load(Ordering::Acquire) {
             let tick_start = Instant::now();
+            // Idle -> active edge. The client has spent this stretch being
+            // fed below its `setFrameRate` hint; force one IDR so it can
+            // re-anchor on the first frame of the recovery rather than
+            // decoding forward from whatever it still holds.
+            let idle_now = self.cfg.idle.enabled()
+                && self.activity.ms_since_activity() >= self.cfg.idle.idle_after_ms;
+            if self.was_idle && !idle_now {
+                self.idr_request.store(true, Ordering::Release);
+            }
+            self.was_idle = idle_now;
             self.tick()?;
             // Idle governor: when pen/touch has been quiet for the
             // configured window, stretch the tick period out to the idle
@@ -663,6 +771,40 @@ mod tests {
     use crate::encoder::{mf::MfBackend, Codec, EncoderBackend, PixelFormat, SessionConfig};
     use crate::monitors;
 
+    fn pt(x: i32, y: i32) -> POINT {
+        POINT { x, y }
+    }
+
+    #[test]
+    fn cursor_inside_captured_output_counts_as_activity() {
+        // Second monitor placed to the right of a 1920-wide primary.
+        let rect = Some((1920, 0, 4800, 1800));
+        assert!(
+            point_in_rect(pt(1920, 0), rect),
+            "top-left corner is inside"
+        );
+        assert!(point_in_rect(pt(3000, 900), rect));
+        assert!(point_in_rect(pt(4799, 1799), rect), "last pixel is inside");
+    }
+
+    #[test]
+    fn cursor_on_another_display_does_not_wake_the_session() {
+        let rect = Some((1920, 0, 4800, 1800));
+        // Working on the laptop's own screen must not pin the tablet at
+        // full rate — this is the whole point of the bounds check.
+        assert!(!point_in_rect(pt(500, 400), rect));
+        // Right/bottom edges are exclusive (Win32 rect convention).
+        assert!(!point_in_rect(pt(4800, 900), rect));
+        assert!(!point_in_rect(pt(3000, 1800), rect));
+    }
+
+    #[test]
+    fn no_rect_counts_movement_anywhere() {
+        // Fallback errs toward staying awake, never toward stalling.
+        assert!(point_in_rect(pt(-5000, -5000), None));
+        assert!(point_in_rect(pt(0, 0), None));
+    }
+
     /// End-to-end: spin the pipeline against the desktop for a few hundred ms,
     /// expect at least a couple of packets and at least one keyframe.
     #[test]
@@ -687,6 +829,7 @@ mod tests {
             pts_epoch: Instant::now(),
             scrgb_sdr_scale: 1.0,
             idle: crate::idle::IdleConfig::disabled(),
+            capture_rect: None,
         };
         let conv = ColorConverter::new(&ctx, cfg.width, cfg.height, cfg.fps).expect("conv");
         // Build the encoder session BEFORE moving ctx into the capturer
