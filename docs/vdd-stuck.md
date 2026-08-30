@@ -129,6 +129,75 @@ for DEVINST X" API. The practical external signals remain DXGI outputs,
 `QueryDisplayConfig(QDC_ALL_PATHS)`, monitor-class PnP children, event logs,
 and the driver's own logs if logging is enabled.
 
+## Follow-up: laggy pointer on the VDD output after a driver reinstall
+
+Symptom: everything streams fine, but the mouse feels laggy the moment it
+crosses onto the tablet's (VDD) screen.
+
+Cause is config, not code. Reinstalling the VDD rewrites
+`C:\VirtualDisplayDriver\vdd_settings.xml` with the installer's defaults —
+which include `<HardwareCursor>false</HardwareCursor>` — **and leaves the
+file with the ReadOnly attribute set**. With `HardwareCursor=false` Windows
+software-composites the cursor into the VDD framebuffer, so a cursor-only
+move has to go through a DWM compose + desktop present before DDA even sees
+it; with `true`, the OS keeps the cursor out of band and
+`penflow-core::cursor_blit` draws it from `DXGI_OUTDUPL_FRAME_INFO`.
+
+The service already pushes the correct config before every enable
+(`service.rs`, `write_installed_vdd_settings`), but `std::fs::write` on a
+ReadOnly file fails with access-denied even though the ACL grants
+`Authenticated Users` Modify — so the push silently no-opped and the driver
+kept the installer's settings. The failure only reached stderr, which is
+invisible in a released build.
+
+Fix:
+
+- `settings.rs`: `write_vdd_settings_file` clears the ReadOnly attribute
+  before writing (`clear_readonly`), with a regression test that writes over
+  a read-only file, plus one asserting the rendered XML keeps
+  `HardwareCursor=true`.
+- `service.rs`: a failed settings push now goes to `debug.log` via
+  `log_diagnostic`, naming the path and pointing at the ReadOnly attribute.
+
+The new config only takes effect on the next VDD **disable → enable** cycle
+(reconnect the tablet). Do not use `RELOAD_DRIVER` — see above.
+
+## Follow-up: mouse lags on the tablet, pen does not
+
+Measured, not guessed. `examples/cursor_probe` against the VDD output while
+moving the mouse over a static desktop:
+
+```
+frames=14637 content=43 cursor_only=14594 pointer_updates=1731
+gap_ms p50=1 p95=4 max=694   (5 s window)
+```
+
+DDA reports the pointer promptly (p50 1 ms), so the cursor source was never
+the problem. The number that matters is `frames`: ~2900 DDA wake-ups per
+second, of which only ~350 carried a pointer update and 43 carried new
+content. The rest are empty.
+
+`LoopState::run` had no pacing in the active path — it slept only in the
+idle-governor branch, so the loop ran at whatever rate `acquire_frame`
+returned at. On a static desktop that is the 16 ms acquire timeout (60 fps),
+which is why this stayed hidden. A mouse moving on the VDD turns it into a
+~2900 Hz spin, each iteration doing a full 2880×1800 `CopyResource`, a cursor
+blit, a BGRA→NV12 convert and an encoder submit. The encoder and the packet
+queue go seconds deep. Pen input never produces that pointer churn — hence
+"the pen is smooth and the mouse is not".
+
+Fix, both in `pipeline.rs`:
+
+- `pace_sleep_ms(fps, tick_elapsed_ms)` — sleep out the remainder of the
+  frame period in the active path. When the idle governor also wants a
+  sleep, the longer of the two wins.
+- Empty wake-ups (`is_cursor_only()` + no pointer update + no shape change)
+  are filtered out before the match, so they fall into the keepalive
+  re-encode path instead of repainting a picture that did not change.
+
+`HardwareCursor` is unrelated to this one; keep it `true` for the reason in
+the section above.
+
 ## Goal
 
 Programmatically enable a Virtual Display Driver (the

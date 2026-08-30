@@ -126,6 +126,16 @@ fn main() -> ExitCode {
     let mut last_shape_log: Option<Instant> = None;
     let mut frames_seen: u64 = 0;
     let mut frames_with_shape: u64 = 0;
+    // Cursor-only accounting. This is the question that decides whether the
+    // pipeline can keep sourcing the pointer from DDA at all: on a static
+    // desktop, does moving the mouse produce frames (LastPresentTime == 0,
+    // LastMouseUpdateTime != 0), and how far apart are they? Gaps in the
+    // hundreds of ms mean the cursor is only carried by content frames,
+    // which is exactly "mouse lags, pen doesn't".
+    let mut cursor_only_frames: u64 = 0;
+    let mut content_frames: u64 = 0;
+    let mut last_pos_update: Option<Instant> = None;
+    let mut gaps_ms: Vec<u64> = Vec::new();
     let start = Instant::now();
     let mut last_summary = start;
 
@@ -139,6 +149,18 @@ fn main() -> ExitCode {
         };
         if let Some(frame) = acquired {
             frames_seen += 1;
+            if frame.is_cursor_only() {
+                cursor_only_frames += 1;
+            } else {
+                content_frames += 1;
+            }
+            if frame.pointer_position().is_some() {
+                let now = Instant::now();
+                if let Some(prev) = last_pos_update {
+                    gaps_ms.push(now.duration_since(prev).as_millis() as u64);
+                }
+                last_pos_update = Some(now);
+            }
             let info = &frame.frame_info;
             let visible = info.PointerPosition.Visible.as_bool();
             let pos = (
@@ -181,12 +203,24 @@ fn main() -> ExitCode {
         }
 
         if last_summary.elapsed() > Duration::from_secs(5) {
+            gaps_ms.sort_unstable();
+            let pick = |q: f64| -> u64 {
+                if gaps_ms.is_empty() {
+                    0
+                } else {
+                    let i = ((gaps_ms.len() - 1) as f64 * q).round() as usize;
+                    gaps_ms[i]
+                }
+            };
             println!(
-                "[probe] (5s summary) frames={} frames_with_shape={} elapsed={:.1}s",
-                frames_seen,
-                frames_with_shape,
+                "[probe] (5s) frames={frames_seen} content={content_frames}                  cursor_only={cursor_only_frames} shape={frames_with_shape}                  pointer_updates={} gap_ms p50={} p95={} max={} elapsed={:.1}s",
+                gaps_ms.len(),
+                pick(0.50),
+                pick(0.95),
+                gaps_ms.last().copied().unwrap_or(0),
                 start.elapsed().as_secs_f64()
             );
+            gaps_ms.clear();
             last_summary = Instant::now();
         }
     }

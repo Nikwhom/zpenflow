@@ -392,6 +392,23 @@ fn spawn_cursor_watcher(
         .ok()
 }
 
+/// Milliseconds left in this frame's period, or `None` when the tick
+/// already overran it (or `fps` is 0 — pacing off).
+///
+/// The idle governor paces the *idle* case; this paces the active one.
+/// Both are "sleep out the remainder of a period", so when they disagree
+/// the longer wins.
+fn pace_sleep_ms(fps: u32, tick_elapsed_ms: u64) -> Option<u64> {
+    if fps == 0 {
+        return None;
+    }
+    let period_ms = 1000 / fps as u64;
+    match period_ms.saturating_sub(tick_elapsed_ms) {
+        0 => None,
+        remaining => Some(remaining),
+    }
+}
+
 /// `true` when `pt` lies inside `rect`, or when there is no rect to test
 /// against. Rect is `(left, top, right, bottom)` in virtual-desktop
 /// coordinates, right/bottom exclusive — the Win32 convention
@@ -466,12 +483,31 @@ impl LoopState {
             // configured window, stretch the tick period out to the idle
             // frame rate. `throttle_sleep_ms` returns `None` while active,
             // so the hot path is one atomic load + one compare.
-            if let Some(sleep_ms) = crate::idle::throttle_sleep_ms(
+            let tick_elapsed_ms = tick_start.elapsed().as_millis() as u64;
+            let idle_sleep = crate::idle::throttle_sleep_ms(
                 self.cfg.idle,
                 self.activity.ms_since_activity(),
-                tick_start.elapsed().as_millis() as u64,
-            ) {
-                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                tick_elapsed_ms,
+            );
+            // Active pacing. `acquire_frame` is the only thing that bounded
+            // this loop, and it bounds it at exactly one rate: the rate DDA
+            // has something to say. On a static desktop that is the acquire
+            // timeout (16 ms → 60 fps), which is why this went unnoticed —
+            // but DDA also wakes on every pointer event, and on the VDD a
+            // moving mouse produced ~2900 wake-ups/second (measured with
+            // examples/cursor_probe), of which only ~350 carried an actual
+            // pointer update. Each one used to run a full-frame copy, cursor
+            // blit, NV12 convert and encoder submit, so moving the mouse
+            // buried the encoder and the packet queue seconds deep. The pen
+            // never produced that churn, which is why only the mouse lagged.
+            // Sleep out the rest of the frame period so the encoder sees
+            // `fps` frames per second and no more.
+            let sleep_ms = match (idle_sleep, pace_sleep_ms(self.cfg.fps, tick_elapsed_ms)) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            if let Some(ms) = sleep_ms {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
             }
         }
         Ok(())
@@ -493,6 +529,18 @@ impl LoopState {
                 return Err(e);
             }
         };
+        // Empty wake-up. DDA signals on pointer events as well as content
+        // changes, and most of those carry nothing at all: no new desktop
+        // image (`LastPresentTime == 0`), no pointer move, no shape change.
+        // Dropping the frame here releases the duplication and falls into
+        // the keepalive re-encode path below, skipping a full-frame copy,
+        // an NV12 convert and a cursor blit that would all reproduce the
+        // picture we already have.
+        let acquired = acquired.filter(|f| {
+            !(f.is_cursor_only()
+                && f.pointer_position().is_none()
+                && f.frame_info.PointerShapeBufferSize == 0)
+        });
         let now = Instant::now();
 
         match acquired {
@@ -773,6 +821,24 @@ mod tests {
 
     fn pt(x: i32, y: i32) -> POINT {
         POINT { x, y }
+    }
+
+    #[test]
+    fn pacing_fills_out_the_frame_period() {
+        // 60 fps → 16 ms period. A 4 ms tick sleeps the remaining 12.
+        assert_eq!(pace_sleep_ms(60, 4), Some(12));
+        assert_eq!(pace_sleep_ms(30, 0), Some(33));
+    }
+
+    #[test]
+    fn pacing_never_sleeps_after_an_overrunning_tick() {
+        assert_eq!(pace_sleep_ms(60, 16), None);
+        assert_eq!(pace_sleep_ms(60, 500), None);
+    }
+
+    #[test]
+    fn pacing_is_off_at_zero_fps() {
+        assert_eq!(pace_sleep_ms(0, 0), None);
     }
 
     #[test]
