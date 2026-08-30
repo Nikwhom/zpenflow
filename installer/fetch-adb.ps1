@@ -1,4 +1,4 @@
-# Pre-build helper: download Google's Android platform-tools and
+﻿# Pre-build helper: download Google's Android platform-tools and
 # extract just the three files Penflow needs into `installer/adb/`.
 # The Tauri MSI bundle includes that folder as a resource so the
 # installed Penflow has its own private adb.exe and never has to

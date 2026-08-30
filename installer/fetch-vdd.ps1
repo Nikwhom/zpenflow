@@ -1,4 +1,4 @@
-# Pre-build helper: download the Virtual Display Driver release bundle
+﻿# Pre-build helper: download the Virtual Display Driver release bundle
 # from VirtualDrivers/Virtual-Display-Driver and extract just the driver
 # files into `installer/vdd-driver/`. The Tauri MSI bundle includes that
 # folder as a resource; the GUI's first-run hook calls

@@ -1,4 +1,4 @@
-# Pre-build helper: download the VMulti virtual HID digitizer driver
+﻿# Pre-build helper: download the VMulti virtual HID digitizer driver
 # bundle from X9VoiD/vmulti-bin and stage the files we ship into
 # `installer/vmulti-driver/`. The Tauri MSI bundle includes that folder
 # as a resource; the WiX fragment at
