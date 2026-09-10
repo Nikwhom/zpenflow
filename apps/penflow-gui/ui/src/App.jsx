@@ -22,6 +22,7 @@ import {
 } from "@fluentui/react-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 // ---------------------------------------------------------------------------
 // Pen feel: Wacom-style pressure curve editor + live test pad.
@@ -53,6 +54,14 @@ function PenFeelCard({ styles, pressure, onChange }) {
     const dragRef = useRef(null); // "threshold" | "max" | "sense"
     const canvasRef = useRef(null);
     const lastPtRef = useRef(null);
+    // Physical desktop position of this window's CLIENT area + its scale
+    // factor, from Tauri. `window.screenX/Y` is the OUTER window in
+    // Chromium DIPs: off by the title bar at 100 % and by hundreds of px
+    // on a scaled or mixed-DPI desktop, so the frame test never matched
+    // the pen's physical desktop pixel and the pad drew nothing.
+    const geomRef = useRef(null);
+    const [padInfo, setPadInfo] = useState("");
+    const padInfoAtRef = useRef(0);
 
     const X = (p) => CURVE_PAD + p * (CURVE_W - 2 * CURVE_PAD);
     const Y = (o) => CURVE_H - CURVE_PAD - o * (CURVE_H - 2 * CURVE_PAD);
@@ -106,25 +115,48 @@ function PenFeelCard({ styles, pressure, onChange }) {
         const ctx = canvas.getContext("2d");
         ctx.fillStyle = "#2b2b2b";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const win = getCurrentWindow();
+        const refreshGeom = async () => {
+            try {
+                const [pos, scale] = await Promise.all([win.innerPosition(), win.scaleFactor()]);
+                geomRef.current = { x: pos.x, y: pos.y, scale };
+            } catch {
+                geomRef.current = null;
+            }
+        };
+        refreshGeom();
+        const unMoved = win.onMoved(refreshGeom).catch(() => null);
+        const unResized = win.onResized(refreshGeom).catch(() => null);
+        const geomTimer = setInterval(refreshGeom, 1000);
+        const note = (text) => {
+            const now = performance.now();
+            if (now - padInfoAtRef.current < 100) return;
+            padInfoAtRef.current = now;
+            setPadInfo(text);
+        };
         const un = listen("pen-feel", (ev) => {
             const s = ev.payload;
             if (!s.contact) { lastPtRef.current = null; return; }
             // Wacom-style "Try Here": only strokes that physically land
             // inside this canvas's on-screen frame are drawn. The sample
-            // carries its mapped desktop-pixel position; compare it to the
-            // canvas's own desktop rect (window position + element rect,
-            // scaled to physical pixels). Put this settings window on the
-            // tablet's display and draw directly in the box.
-            const dpr = window.devicePixelRatio || 1;
+            // carries its mapped desktop-pixel position (physical, virtual-
+            // screen space); compare it to the canvas's own desktop rect:
+            // the client area's physical position from Tauri plus the
+            // element rect scaled by the window's scale factor. Put this
+            // settings window on the tablet's display and draw in the box.
             const r = canvas.getBoundingClientRect();
-            const left = (window.screenX + r.left) * dpr;
-            const top = (window.screenY + r.top) * dpr;
-            const w = r.width * dpr;
-            const h = r.height * dpr;
+            const geom = geomRef.current;
+            const scale = geom ? geom.scale : (window.devicePixelRatio || 1);
+            const left = geom ? geom.x + r.left * scale : (window.screenX + r.left) * scale;
+            const top = geom ? geom.y + r.top * scale : (window.screenY + r.top) * scale;
+            const w = r.width * scale;
+            const h = r.height * scale;
             if (s.x_px < left || s.x_px > left + w || s.y_px < top || s.y_px > top + h) {
                 lastPtRef.current = null; // stroke left the frame
+                note(`pen at ${s.x_px},${s.y_px}: outside the box (box ${Math.round(left)},${Math.round(top)} ${Math.round(w)}x${Math.round(h)})`);
                 return;
             }
+            note(`pen at ${s.x_px},${s.y_px}: raw ${s.raw.toFixed(2)} -> ${s.curved.toFixed(2)}`);
             const pt = {
                 x: ((s.x_px - left) / w) * canvas.width,
                 y: ((s.y_px - top) / h) * canvas.height,
@@ -142,7 +174,12 @@ function PenFeelCard({ styles, pressure, onChange }) {
             }
             lastPtRef.current = pt;
         });
-        return () => { un.then((fn) => fn()).catch(() => {}); };
+        return () => {
+            un.then((fn) => fn()).catch(() => {});
+            unMoved.then((fn) => fn && fn());
+            unResized.then((fn) => fn && fn());
+            clearInterval(geomTimer);
+        };
     }, []);
 
     const clearPad = () => {
@@ -198,6 +235,9 @@ function PenFeelCard({ styles, pressure, onChange }) {
                         height={CURVE_H}
                         style={{ background: "#2b2b2b", borderRadius: 6 }}
                     />
+                    <Caption1 className={styles.hint} style={{ minHeight: "1.2em" }}>
+                        {padInfo || "no pen sample yet"}
+                    </Caption1>
                     <div style={{ display: "flex", gap: "8px" }}>
                         <Button size="small" onClick={clearPad}>Clear</Button>
                         <Button
