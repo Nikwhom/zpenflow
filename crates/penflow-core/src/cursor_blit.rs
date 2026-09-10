@@ -111,8 +111,6 @@ pub struct CursorBlitter {
 struct CachedCursor {
     width: u32,
     height: u32,
-    hot_x: i32,
-    hot_y: i32,
     /// Generation counter incremented when `update_shape` actually rebuilds
     /// the GPU texture. Lets the pipeline cheaply skip redundant uploads.
     generation: u64,
@@ -339,8 +337,6 @@ impl CursorBlitter {
         self.cursor = Some(CachedCursor {
             width: shape.width,
             height: shape.height,
-            hot_x: shape.hot_x,
-            hot_y: shape.hot_y,
             generation: next_gen,
             _texture: tex,
             srv,
@@ -350,9 +346,14 @@ impl CursorBlitter {
     }
 
     /// Composite the cached cursor onto the bound target at screen position
-    /// `(pos_x, pos_y)`. Position is in target-local pixels, with the OS
-    /// reporting it WITHOUT the hotspot applied — we subtract the hotspot
-    /// here to get the bitmap's top-left.
+    /// `(pos_x, pos_y)`. Position is in target-local pixels and is the
+    /// bitmap's TOP-LEFT already: `DXGI_OUTDUPL_POINTER_POSITION.Position`
+    /// has the hotspot subtracted by the OS (Microsoft's DesktopDuplication
+    /// sample draws at `Position` verbatim, and the value goes negative when
+    /// the hotspot sits past the output's edge). Subtracting `HotSpot` again
+    /// here drew every cursor with a non-zero hotspot up-left by that much:
+    /// invisible on the arrow (hotspot 0,0), a clear offset on Photoshop's
+    /// centre-hotspot brush circle.
     ///
     /// Returns silently when there's no cached shape, when the cursor lies
     /// fully off-target, or when DDA reported `visible == false` (caller
@@ -362,8 +363,8 @@ impl CursorBlitter {
             Some(c) => c,
             None => return Ok(()),
         };
-        let bitmap_x = pos_x - cursor.hot_x;
-        let bitmap_y = pos_y - cursor.hot_y;
+        let bitmap_x = pos_x;
+        let bitmap_y = pos_y;
         let quad = match compute_clipped_quad(
             bitmap_x,
             bitmap_y,

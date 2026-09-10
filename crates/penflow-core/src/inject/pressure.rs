@@ -60,7 +60,11 @@ impl PressureCurve {
     pub fn new(threshold: f32, max: f32, gamma: f32) -> Self {
         // NaN slips through `clamp` (NaN.clamp(..) == NaN), so sanitize
         // non-finite params to the identity values first.
-        let threshold = if threshold.is_finite() { threshold } else { 0.0 };
+        let threshold = if threshold.is_finite() {
+            threshold
+        } else {
+            0.0
+        };
         let max = if max.is_finite() { max } else { 1.0 };
         let threshold = threshold.clamp(MIN_THRESHOLD, MAX_THRESHOLD);
         // Keep a usable ramp: max must sit meaningfully above threshold.
@@ -158,10 +162,7 @@ mod tests {
                     let mut prev = -1.0f32;
                     for i in 0..=200 {
                         let out = c.apply(i as f32 / 200.0);
-                        assert!(
-                            out >= prev - 1e-6,
-                            "non-monotonic at t={t} m={m} g={g}"
-                        );
+                        assert!(out >= prev - 1e-6, "non-monotonic at t={t} m={m} g={g}");
                         assert!((0.0..=1.0).contains(&out));
                         prev = out;
                     }

@@ -227,11 +227,7 @@ impl MfSession {
             // Peak == mean: motion may use the full configured budget,
             // static content undershoots. Best-effort — a backend that
             // rejects MaxBitRate still runs VBR against the mean.
-            let _ = set_codec_ui4(
-                &codec_api,
-                &CODECAPI_AVEncCommonMaxBitRate,
-                cfg.bitrate_bps,
-            );
+            let _ = set_codec_ui4(&codec_api, &CODECAPI_AVEncCommonMaxBitRate, cfg.bitrate_bps);
         }
         // Quality-vs-speed preset (0 = fastest, 100 = best quality).
         // Default 33 leans toward speed: at desktop-streaming bitrates the

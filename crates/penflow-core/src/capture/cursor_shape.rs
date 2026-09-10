@@ -48,8 +48,10 @@ pub struct CursorShape {
     pub kind: ShapeKind,
     pub width: u32,
     pub height: u32,
-    /// Hot-spot offset into the bitmap (`info.HotSpot`). Caller subtracts
-    /// these from the cursor screen position to find the bitmap's top-left.
+    /// Hot-spot offset into the bitmap (`info.HotSpot`), kept for
+    /// diagnostics. Do NOT subtract it from the DDA pointer position: that
+    /// position is already the bitmap's top-left (the OS applies the
+    /// hotspot before reporting it).
     pub hot_x: i32,
     pub hot_y: i32,
     /// Tightly-packed BGRA (B, G, R, A) bytes, premultiplied alpha.
