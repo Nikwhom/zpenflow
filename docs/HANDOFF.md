@@ -395,6 +395,50 @@ framebuffer. `settings.rs::clear_readonly` handles it; failures are logged to
 
 Full writeup of both, with the probe numbers: [`vdd-stuck.md`](vdd-stuck.md).
 
+### 4.9 A secure-desktop switch kills a one-shot DDA reinit
+
+Any UAC prompt (also Ctrl+Alt+Del and the lock screen) moves Windows to
+the secure desktop. `AcquireNextFrame` fails on every duplication
+(`DXGI_ERROR_ACCESS_LOST` on the Intel output, `DXGI_ERROR_INVALID_CALL`
+on the NVIDIA one), and while that desktop is up a re-create fails too:
+`DuplicateOutput` returns `E_ACCESSDENIED` ("the application does not have
+access to the current desktop"). Measured 2026-10-04 with
+`examples/cursor_probe` on both monitors across one prompt. The capturer
+used to try the reinit ONCE and propagate the error; `LoopState::run`
+ended; nothing logged it; the session stayed up. What the user saw: the
+tablet kept the last frame with the cursor baked in where it had been, and
+from then on the pen moved nothing on screen — "the mouse disappears when
+Windows asks for admin privileges".
+
+Rule: a lost duplication is a STATE, not an error. `DxgiCapturer` keeps
+`duplication: Option<_>`, re-creates it on later ticks with a 100 ms →
+1 s backoff (`ReinitState`), sleeps the acquire timeout meanwhile so the
+loop keeps its cadence re-encoding the keepalive, and logs the loss and
+the recovery (`[dxgi] duplication of \\.\DISPLAYn lost … re-created after
+2.5 s, 5 failed attempt(s)` on the test prompt). A fresh duplication's
+first pointer frame carries the shape again (verified), so the cursor
+comes back by itself. The secure desktop itself is never captured —
+Windows denies that to everything but SYSTEM — so the tablet shows the
+last frame while a prompt is up; that is the floor, not a bug.
+`Pipeline::start` now logs a loop that exits on an error; a silent
+capture-thread death is how this hid.
+
+### 4.10 Mouse-button bindings: sync the cursor on the edge, not per sample
+
+`dispatch_pen_buttons` used to `SendInput` an absolute mouse move on EVERY
+pen sample while a barrel button bound to `Binding::MouseButton` was held
+("keep the cursor at the pen tip"). The pen already drives the system
+cursor on both backends (VMulti is a real HID digitizer, the synthetic
+pointer carries PRIMARY), so the hold produced a second input stream at
+the pen's full rate, each move rounded to 1/65535 of the virtual desktop
+and so up to a pixel off the pen's own position. An app that acts on every
+mouse move while a button is down — ZBrush rotating the view on a
+right-button hover-drag — redrew twice per sample on a one-pixel zigzag
+and fell behind the pen ("right mouse hover in ZBrush is very laggy").
+The sync now fires only on the sample that presses or releases the
+binding (`mouse_sync_needed`), which is the only moment an app reads
+`GetCursorPos` for the button event.
+
 ---
 
 ## 5. Forward plan

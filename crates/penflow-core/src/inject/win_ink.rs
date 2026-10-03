@@ -216,9 +216,11 @@ impl InputInjector {
     /// OLD eraser state so the driver sees a clean `Inverted` transition.
     ///
     /// Also dispatches barrel-button transitions through the active
-    /// `PenButtonProfile` BEFORE the pen sample lands. Mouse-button bindings
-    /// first sync the legacy mouse cursor to this sample's pen tip so apps
-    /// that position context menus from `GetCursorPos` see the pen location.
+    /// `PenButtonProfile` BEFORE the pen sample lands. On the sample that
+    /// presses or releases a mouse-button binding the legacy mouse cursor
+    /// is first synced to the pen tip so apps that position context menus
+    /// from `GetCursorPos` see the pen location; while the button is held
+    /// the pen alone drives the cursor (`mouse_sync_needed`).
     ///
     /// Routes to VMulti when present (issue #23). The synthetic-pointer
     /// path is the fallback for users who haven't installed the driver.
@@ -298,22 +300,19 @@ impl InputInjector {
         let pressed_now = !prev & now_bits;
         let released_now = prev & !now_bits;
 
-        let mut sync_mouse_to_pen = false;
-        for slot in 0u8..3 {
-            let mask = 1u8 << slot;
-            let binding = match slot {
-                0 => &self.pen_profile.barrel_1,
-                1 => &self.pen_profile.barrel_2,
-                _ => &self.pen_profile.tertiary,
-            };
-            if matches!(binding, Binding::MouseButton(_))
-                && (now_bits & mask != 0 || released_now & mask != 0)
-            {
-                sync_mouse_to_pen = true;
-                break;
-            }
-        }
-        if sync_mouse_to_pen {
+        // Sync the legacy mouse cursor to the pen tip ONLY on the edge of a
+        // mouse-button binding — the sample that presses or releases it —
+        // never on every sample while the button is held. The pen already
+        // drives the system cursor on both backends (VMulti is a real HID
+        // digitizer; the synthetic pointer carries PRIMARY), so a per-sample
+        // `SendInput` move during the hold was a second input stream at the
+        // pen's full rate: every hover sample became a HID pen report PLUS an
+        // absolute mouse move, the latter rounded to 1/65535 of the virtual
+        // desktop and so up to a pixel off the pen's own position. An app
+        // that acts on every mouse move while a button is down — ZBrush
+        // rotating the view on a right-button hover-drag — redrew twice per
+        // sample on a one-pixel zigzag and fell seconds behind the pen.
+        if mouse_sync_needed(&self.pen_profile, pressed_now, released_now) {
             send_mouse_move_to(sample.x, sample.y)?;
         }
 
@@ -702,10 +701,28 @@ fn send_mouse_button(kind: MouseButtonKind, down: bool) -> EngineResult<()> {
     Ok(())
 }
 
-/// Move the legacy mouse cursor to a pen-tip pixel before/while a synthetic
-/// mouse button is held. This keeps `SendInput` button events and pen samples
-/// in the same screen position for apps that read the mouse cursor instead of
-/// the pen pointer coordinates.
+/// `true` when this sample presses or releases a barrel button bound to a
+/// synthetic mouse button — the only moments the legacy cursor must be
+/// placed at the pen tip before `SendInput` fires. A held button changes
+/// nothing: the pen moves the cursor by itself between the edges.
+fn mouse_sync_needed(profile: &PenButtonProfile, pressed_now: u8, released_now: u8) -> bool {
+    let edges = pressed_now | released_now;
+    if edges == 0 {
+        return false;
+    }
+    [&profile.barrel_1, &profile.barrel_2, &profile.tertiary]
+        .iter()
+        .enumerate()
+        .any(|(slot, binding)| {
+            matches!(binding, Binding::MouseButton(_)) && edges & (1u8 << slot) != 0
+        })
+}
+
+/// Move the legacy mouse cursor to a pen-tip pixel right before a synthetic
+/// mouse button goes down or up. This keeps the `SendInput` button event and
+/// the pen sample at the same screen position for apps that read the mouse
+/// cursor instead of the pen pointer coordinates (context menus placed from
+/// `GetCursorPos`). Edge-only: see `mouse_sync_needed`.
 fn send_mouse_move_to(x: i32, y: i32) -> EngineResult<()> {
     let (vx, vy, vw, vh) = virtual_screen_rect();
     let input = INPUT {
@@ -743,6 +760,7 @@ fn normalize_absolute_mouse_coord(pos: i32, origin: i32, span: i32) -> i32 {
 mod tests {
     use super::super::TouchState;
     use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_E;
 
     #[test]
     fn pen_flags_hover_arrival() {
@@ -819,6 +837,36 @@ mod tests {
                 "missing PRIMARY for (was_range={wr}, was_contact={wc}, range={r}, contact={c})"
             );
         }
+    }
+
+    /// The legacy-cursor sync fires on the press and release edges of a
+    /// mouse-button binding and never while the button is merely held. A
+    /// per-sample sync during the hold doubled every pen sample into a
+    /// second mouse move and lagged ZBrush's right-button hover-drag.
+    #[test]
+    fn mouse_sync_only_on_mouse_button_edges() {
+        let profile = PenButtonProfile {
+            barrel_1: Binding::MouseButton(MouseButtonKind::Right),
+            barrel_2: Binding::MouseButton(MouseButtonKind::Middle),
+            tertiary: Binding::KeyTap(VK_E),
+            tip_threshold: 0.0,
+        };
+        // barrel-1 press edge, release edge.
+        assert!(mouse_sync_needed(&profile, 0b001, 0));
+        assert!(mouse_sync_needed(&profile, 0, 0b001));
+        // barrel-2 (middle) edges too.
+        assert!(mouse_sync_needed(&profile, 0b010, 0));
+        assert!(mouse_sync_needed(&profile, 0, 0b010));
+        // Held with no change: nothing to sync — this is the hover-drag.
+        assert!(!mouse_sync_needed(&profile, 0, 0));
+        // The tertiary's edge is a key tap, not a mouse button.
+        assert!(!mouse_sync_needed(&profile, 0b100, 0));
+        assert!(!mouse_sync_needed(&profile, 0, 0b100));
+
+        // The default profile has no mouse-button binding at all.
+        let keys = PenButtonProfile::default();
+        assert!(!mouse_sync_needed(&keys, 0b111, 0));
+        assert!(!mouse_sync_needed(&keys, 0, 0b111));
     }
 
     #[test]

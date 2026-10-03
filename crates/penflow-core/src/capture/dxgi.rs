@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Dxgi::{
         DXGI_FORMAT_R8G8B8A8_UNORM,
     },
     IDXGIOutput, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
-    DXGI_ERROR_ACCESS_DENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    DXGI_ERROR_ACCESS_DENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_INVALID_CALL,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED};
 
@@ -39,6 +39,23 @@ unsafe impl Send for DxgiCapturer {}
 /// Holds an `IDXGIOutputDuplication` against a specific output, with
 /// transparent recovery from `DXGI_ERROR_ACCESS_LOST` /
 /// `DXGI_ERROR_ACCESS_DENIED`.
+///
+/// The recovery is a RETRY LOOP, never a single attempt (the UAC bug): a
+/// secure-desktop switch — any UAC prompt, Ctrl+Alt+Del, the lock screen —
+/// takes the duplication away with `ACCESS_LOST`, and while that desktop
+/// is up `DuplicateOutput` itself fails (`E_ACCESSDENIED`, "the
+/// application does not have access to the current desktop"; measured
+/// `DXGI_ERROR_INVALID_CALL` on the NVIDIA output of the same switch). A
+/// reinit that returned that error killed the capture thread: the tablet
+/// kept the last frame, cursor baked in where it was, and the pen moved
+/// nothing on screen until the session was restarted. Now a lost
+/// duplication is re-created on later ticks (`ReinitState`, 100 ms
+/// doubling to 1 s between attempts), the loop re-encodes the keepalive
+/// meanwhile, and the first frame of the fresh duplication carries the
+/// cursor shape again (DDA sends it on a new duplication's first frame).
+/// The secure desktop itself is never captured — Windows denies that to
+/// anything but SYSTEM — so the tablet shows the last frame while a
+/// prompt is up, and comes back the moment it closes.
 pub struct DxgiCapturer {
     /// Re-opened on every reinit (the duplication is bound to a specific
     /// IDXGIOutput instance; if the desktop session changes, we re-EnumOutputs).
@@ -46,7 +63,9 @@ pub struct DxgiCapturer {
     /// The D3D11 context whose device backs this duplication. The output
     /// MUST belong to the same adapter as `ctx.adapter` — checked in `new`.
     ctx: D3d11Context,
-    duplication: IDXGIOutputDuplication,
+    /// `None` while the duplication is lost and not yet re-created.
+    duplication: Option<IDXGIOutputDuplication>,
+    reinit: ReinitState,
     width: u32,
     height: u32,
     /// True iff a frame is currently held (between `acquire` and `release`).
@@ -55,6 +74,58 @@ pub struct DxgiCapturer {
     /// True iff we successfully called `SetThreadExecutionState` with
     /// `ES_DISPLAY_REQUIRED` and need to clear it on drop.
     display_required: bool,
+}
+
+/// First wait between two re-creation attempts of a lost duplication.
+const REINIT_DELAY_MIN: Duration = Duration::from_millis(100);
+/// Ceiling of the doubling wait. A UAC prompt is answered in seconds; a
+/// lock screen can stay up for hours, and one attempt a second is nothing.
+const REINIT_DELAY_MAX: Duration = Duration::from_secs(1);
+
+/// Where the capturer is in re-creating a lost duplication.
+#[derive(Clone, Copy, Debug)]
+struct ReinitState {
+    /// When the duplication was lost; `None` while it is healthy.
+    lost_at: Option<Instant>,
+    /// Earliest time of the next attempt.
+    next_attempt: Instant,
+    /// Wait to schedule after the next failure.
+    delay: Duration,
+    /// Failed attempts since `lost_at`.
+    attempts: u32,
+}
+
+impl ReinitState {
+    fn healthy() -> Self {
+        Self {
+            lost_at: None,
+            next_attempt: Instant::now(),
+            delay: REINIT_DELAY_MIN,
+            attempts: 0,
+        }
+    }
+
+    /// Record a failed attempt at `now` and schedule the next one.
+    fn failed(&mut self, now: Instant) {
+        self.attempts += 1;
+        self.next_attempt = now + self.delay;
+        self.delay = next_reinit_delay(self.delay);
+    }
+}
+
+/// The wait after one more failed re-creation: double it, capped at
+/// `REINIT_DELAY_MAX`.
+fn next_reinit_delay(prev: Duration) -> Duration {
+    (prev * 2).min(REINIT_DELAY_MAX)
+}
+
+/// `true` for the `AcquireNextFrame` results that mean "this duplication
+/// is gone, make a new one" rather than "no frame yet" or "fatal".
+fn is_duplication_lost(code: windows::core::HRESULT) -> bool {
+    code == DXGI_ERROR_ACCESS_LOST
+        || code == DXGI_ERROR_ACCESS_DENIED
+        || code == DXGI_STATUS_OCCLUDED
+        || code == DXGI_ERROR_INVALID_CALL
 }
 
 /// One acquired DDA frame. Drops automatically release the duplication so the
@@ -116,11 +187,15 @@ impl<'a> AcquiredFrame<'a> {
         if needed == 0 {
             return Ok(None);
         }
+        // A frame is only ever held on a live duplication.
+        let Some(duplication) = self.capturer.duplication.as_ref() else {
+            return Ok(None);
+        };
         let mut buf = vec![0u8; needed as usize];
         let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
         let mut required: u32 = 0;
         unsafe {
-            self.capturer.duplication.GetFramePointerShape(
+            duplication.GetFramePointerShape(
                 needed,
                 buf.as_mut_ptr() as *mut _,
                 &mut required,
@@ -148,10 +223,7 @@ impl<'a> AcquiredFrame<'a> {
 
 impl Drop for AcquiredFrame<'_> {
     fn drop(&mut self) {
-        if self.capturer.frame_held {
-            let _ = unsafe { self.capturer.duplication.ReleaseFrame() };
-            self.capturer.frame_held = false;
-        }
+        self.capturer.release_held_frame();
     }
 }
 
@@ -183,10 +255,26 @@ impl DxgiCapturer {
             height: monitor.height,
             monitor,
             ctx,
-            duplication,
+            duplication: Some(duplication),
+            reinit: ReinitState::healthy(),
             frame_held: false,
             display_required,
         })
+    }
+
+    /// `true` while the duplication is lost and being re-created.
+    pub fn is_lost(&self) -> bool {
+        self.duplication.is_none()
+    }
+
+    /// Release the frame `acquire_frame` handed out, if one is still held.
+    fn release_held_frame(&mut self) {
+        if self.frame_held {
+            if let Some(d) = self.duplication.as_ref() {
+                let _ = unsafe { d.ReleaseFrame() };
+            }
+            self.frame_held = false;
+        }
     }
 
     pub fn output_size(&self) -> (u32, u32) {
@@ -205,15 +293,31 @@ impl DxgiCapturer {
     ///
     /// Returns:
     ///   - `Ok(Some(frame))` — frame ready; drop the `AcquiredFrame` to release.
-    ///   - `Ok(None)` — DDA timeout (no new content within `timeout`). Caller
+    ///   - `Ok(None)` — DDA timeout (no new content within `timeout`), or the
+    ///     duplication is lost and being re-created (`is_lost`). Caller
     ///     typically falls back to keepalive frame.
-    ///   - `Err(EngineError::Win32)` — fatal HRESULT after recovery attempt.
+    ///   - `Err(EngineError::Win32)` — a fatal HRESULT that is not a lost
+    ///     duplication (device removed, bad resource).
     pub fn acquire_frame(&mut self, timeout: Duration) -> EngineResult<Option<AcquiredFrame<'_>>> {
-        if self.frame_held {
-            // Defensive: previous AcquiredFrame must have been dropped. If we
-            // ever see this, fix the caller — DDA refuses re-acquire otherwise.
-            let _ = unsafe { self.duplication.ReleaseFrame() };
-            self.frame_held = false;
+        // Defensive: previous AcquiredFrame must have been dropped. If we
+        // ever see this, fix the caller — DDA refuses re-acquire otherwise.
+        self.release_held_frame();
+
+        if self.duplication.is_none() {
+            // Lost. Wait out the acquire timeout the way DDA would have
+            // (keeps the caller's loop at its normal cadence), then try to
+            // re-create once the backoff allows.
+            let now = Instant::now();
+            if now < self.reinit.next_attempt {
+                std::thread::sleep(timeout.min(self.reinit.next_attempt - now));
+                return Ok(None);
+            }
+            self.try_reinit();
+            if self.duplication.is_none() {
+                std::thread::sleep(timeout);
+                return Ok(None);
+            }
+            // Fresh duplication: fall through and acquire from it.
         }
 
         let timeout_ms = clamp_timeout_ms(timeout);
@@ -222,6 +326,8 @@ impl DxgiCapturer {
 
         let r = unsafe {
             self.duplication
+                .as_ref()
+                .expect("duplication re-created above")
                 .AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource)
         };
 
@@ -244,39 +350,80 @@ impl DxgiCapturer {
             {
                 Ok(None)
             }
-            Err(e)
-                if e.code() == DXGI_ERROR_ACCESS_LOST
-                    || e.code() == DXGI_ERROR_ACCESS_DENIED
-                    || e.code() == DXGI_STATUS_OCCLUDED =>
-            {
-                // Transparent reinit: another fullscreen app stole the
-                // duplication, or the desktop session was switched. Try once;
-                // if reinit fails we surface it.
-                self.reinit()?;
+            Err(e) if is_duplication_lost(e.code()) => {
+                // Another fullscreen app stole the duplication, or the
+                // desktop was switched (UAC, lock screen). Drop it and try
+                // once right away; a failure schedules the retry loop
+                // instead of ending the capture thread.
+                self.mark_lost(e.code());
+                self.try_reinit();
                 Ok(None)
             }
             Err(e) => Err(EngineError::Win32(e)),
         }
     }
 
+    /// Forget a duplication that `AcquireNextFrame` reported gone.
+    fn mark_lost(&mut self, code: windows::core::HRESULT) {
+        self.release_held_frame();
+        self.duplication = None;
+        let now = Instant::now();
+        self.reinit = ReinitState {
+            lost_at: Some(now),
+            next_attempt: now,
+            delay: REINIT_DELAY_MIN,
+            attempts: 0,
+        };
+        eprintln!(
+            "[dxgi] duplication of {} lost (0x{:08X}); re-creating",
+            self.monitor.device_name, code.0 as u32
+        );
+    }
+
+    /// One re-creation attempt of a lost duplication; schedules the next
+    /// one on failure, logs the recovery on success.
+    fn try_reinit(&mut self) {
+        let now = Instant::now();
+        match self.reinit() {
+            Ok(()) => {
+                if let Some(lost_at) = self.reinit.lost_at {
+                    eprintln!(
+                        "[dxgi] duplication of {} re-created after {:.1} s, {} failed attempt(s)",
+                        self.monitor.device_name,
+                        now.duration_since(lost_at).as_secs_f64(),
+                        self.reinit.attempts
+                    );
+                }
+                self.reinit = ReinitState::healthy();
+            }
+            Err(e) => {
+                self.reinit.failed(now);
+                if self.reinit.attempts == 1 {
+                    eprintln!(
+                        "[dxgi] re-create of {} failed ({e:?}); retrying until it works",
+                        self.monitor.device_name
+                    );
+                }
+            }
+        }
+    }
+
     /// Tear down the existing duplication and create a new one against the
     /// same output. Used after `DXGI_ERROR_ACCESS_LOST` / `_ACCESS_DENIED`.
+    /// On failure the capturer is left WITHOUT a duplication (`is_lost`);
+    /// `acquire_frame` keeps retrying.
     pub fn reinit(&mut self) -> EngineResult<()> {
-        if self.frame_held {
-            let _ = unsafe { self.duplication.ReleaseFrame() };
-            self.frame_held = false;
-        }
+        self.release_held_frame();
+        self.duplication = None;
         let output = self.monitor.open_output(&self.ctx.adapter)?;
-        self.duplication = create_duplication(&output, &self.ctx)?;
+        self.duplication = Some(create_duplication(&output, &self.ctx)?);
         Ok(())
     }
 }
 
 impl Drop for DxgiCapturer {
     fn drop(&mut self) {
-        if self.frame_held {
-            let _ = unsafe { self.duplication.ReleaseFrame() };
-        }
+        self.release_held_frame();
         if self.display_required {
             let _ = unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
         }
@@ -337,6 +484,56 @@ mod tests {
     use super::*;
     use crate::d3d11::create_dxgi_factory;
     use crate::monitors;
+
+    /// The retry schedule of a lost duplication: 100 ms, 200, 400, 800,
+    /// then 1 s for ever — a UAC prompt is back within a few attempts, a
+    /// lock screen costs one attempt a second.
+    #[test]
+    fn reinit_backoff_doubles_to_one_second() {
+        let mut d = REINIT_DELAY_MIN;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            seen.push(d);
+            d = next_reinit_delay(d);
+        }
+        assert_eq!(
+            seen,
+            [100, 200, 400, 800, 1000, 1000]
+                .map(Duration::from_millis)
+                .to_vec()
+        );
+
+        let t0 = Instant::now();
+        let mut st = ReinitState {
+            lost_at: Some(t0),
+            next_attempt: t0,
+            delay: REINIT_DELAY_MIN,
+            attempts: 0,
+        };
+        st.failed(t0);
+        assert_eq!(st.attempts, 1);
+        assert_eq!(st.next_attempt, t0 + Duration::from_millis(100));
+        st.failed(t0 + Duration::from_millis(100));
+        assert_eq!(st.attempts, 2);
+        assert_eq!(st.next_attempt, t0 + Duration::from_millis(300));
+        assert!(ReinitState::healthy().lost_at.is_none());
+    }
+
+    /// The HRESULTs the UAC switch produced on this machine — ACCESS_LOST
+    /// from the acquire, then E_ACCESSDENIED from the re-create on the
+    /// Intel output and DXGI_ERROR_INVALID_CALL on the NVIDIA one — all
+    /// mean "re-create", none of them "give up".
+    #[test]
+    fn lost_set_covers_the_secure_desktop_switch() {
+        assert!(is_duplication_lost(DXGI_ERROR_ACCESS_LOST));
+        assert!(is_duplication_lost(DXGI_ERROR_ACCESS_DENIED));
+        assert!(is_duplication_lost(DXGI_STATUS_OCCLUDED));
+        assert!(is_duplication_lost(DXGI_ERROR_INVALID_CALL));
+        assert!(!is_duplication_lost(DXGI_ERROR_WAIT_TIMEOUT));
+        assert!(!is_duplication_lost(
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED
+        ));
+    }
 
     /// End-to-end: open the first attached output and grab one frame. The
     /// timeout is generous (500 ms); CI runs may legitimately have a static

@@ -286,7 +286,14 @@ impl Pipeline {
                     start_instant: pts_epoch,
                     last_dda_format: None,
                 };
-                state.run()
+                let result = state.run();
+                // A loop that ends on an error leaves the session alive
+                // with a frozen picture (the UAC bug hid behind this for
+                // months: the capturer gave up, nothing said so). Say so.
+                if let Err(e) = &result {
+                    eprintln!("[pipeline] capture loop EXITED on error: {e:?}");
+                }
+                result
             })
             .map_err(|_| EngineError::NotInitialized)?;
 
