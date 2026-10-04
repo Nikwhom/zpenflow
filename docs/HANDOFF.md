@@ -455,6 +455,11 @@ for a 0.0 channel — exact for the 0x00/0xFF channels every real XOR
 cursor uses, and skipped entirely for the colour cursor (`has_invert`).
 Sunshine's cursor path does the same.
 
+4.9, 4.10 and 4.11 were all GUI-confirmed by Nik on 2026-10-04 (build
+`2c488c5`, installed over `C:\Program Files\Penflow`): ZBrush right-button
+hover-drag smooth, the stream survives a UAC prompt, the I-beam shows over
+the search bar.
+
 ---
 
 ## 5. Forward plan
