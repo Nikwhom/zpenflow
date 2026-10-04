@@ -439,6 +439,22 @@ The sync now fires only on the sample that presses or releases the
 binding (`mouse_sync_needed`), which is the only moment an app reads
 `GetCursorPos` for the button event.
 
+### 4.11 XOR cursor pixels are not transparent
+
+`cursor_shape.rs` rendered every "XOR with the screen" pixel — the
+AND=1/XOR=1 cell of a monochrome cursor, the alpha=0xFF pixel of a
+masked-colour one — as transparent. The Windows I-beam consists of nothing
+else, so over any text field the tablet showed NO cursor at all ("the
+mouse disappears when I drag it to the search bar", 2026-10-04; the
+probe saw the shape switch to a 2560-byte monochrome buffer at that
+moment). `CursorShape::invert` now carries those pixels as a second sprite
+(the XOR colour; white for monochrome) and `CursorBlitter::composite`
+draws it in a second pass with the blend `SRC=INV_DEST_COLOR,
+DEST=INV_SRC_COLOR`, which yields `1 - dest` for a 1.0 channel and `dest`
+for a 0.0 channel — exact for the 0x00/0xFF channels every real XOR
+cursor uses, and skipped entirely for the colour cursor (`has_invert`).
+Sunshine's cursor path does the same.
+
 ---
 
 ## 5. Forward plan

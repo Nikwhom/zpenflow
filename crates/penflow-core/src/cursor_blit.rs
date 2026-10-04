@@ -11,6 +11,17 @@
 //! output too (alpha=255 for opaque, alpha=0 for transparent), so the same
 //! blend state covers all three.
 //!
+//! XOR pixels get a SECOND draw. Monochrome and masked-colour cursors can
+//! mark pixels "XOR with the screen" — the I-beam is made of nothing else,
+//! so rendering those pixels transparent (what this did until 2026-10-04)
+//! made the text cursor invisible on the tablet ("the mouse disappears when
+//! I drag it to the search bar"). `CursorShape::invert` carries the XOR
+//! colour per pixel (white for monochrome), and `composite` draws it with
+//! the blend `SRC=INV_DEST_COLOR, DEST=INV_SRC_COLOR`: a 1.0 channel yields
+//! `1 - dest` (the inversion), a 0.0 channel leaves `dest` alone. Exact for
+//! the 0x00 / 0xFF channels every real XOR cursor uses; Sunshine does the
+//! same. The pass is skipped for the common colour cursor.
+//!
 //! State pollution: this module unconditionally re-binds VS, PS, IA, RS,
 //! OM, blend, and viewport on every `composite()` call. The pipeline's
 //! `ColorConverter::convert` runs through `ID3D11VideoContext1::VideoProcessorBlt`,
@@ -29,14 +40,15 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11BlendState, ID3D11Buffer, ID3D11InputLayout, ID3D11PixelShader, ID3D11RasterizerState,
     ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
     ID3D11VertexShader, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BIND_VERTEX_BUFFER, D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE,
-    D3D11_BLEND_OP_ADD, D3D11_BLEND_ZERO, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL,
-    D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE, D3D11_CULL_NONE, D3D11_FILL_SOLID,
-    D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_VERTEX_DATA,
-    D3D11_MAP_WRITE_DISCARD, D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_BLEND_DESC,
-    D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D,
-    D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_RTV, D3D11_TEXTURE2D_DESC,
-    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
+    D3D11_BIND_VERTEX_BUFFER, D3D11_BLEND_DESC, D3D11_BLEND_INV_DEST_COLOR,
+    D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_INV_SRC_COLOR, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD,
+    D3D11_BLEND_ZERO, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_COMPARISON_NEVER,
+    D3D11_CPU_ACCESS_WRITE, D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_FILTER_MIN_MAG_MIP_POINT,
+    D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_VERTEX_DATA, D3D11_MAP_WRITE_DISCARD,
+    D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_BLEND_DESC, D3D11_RENDER_TARGET_VIEW_DESC,
+    D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SAMPLER_DESC,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_RTV, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC,
@@ -101,6 +113,8 @@ pub struct CursorBlitter {
     vertex_buffer: ID3D11Buffer,
     sampler: ID3D11SamplerState,
     blend_state: ID3D11BlendState,
+    /// `SRC=INV_DEST_COLOR, DEST=INV_SRC_COLOR`: the XOR pass's inversion.
+    invert_blend_state: ID3D11BlendState,
     rasterizer: ID3D11RasterizerState,
     target_rtv: ID3D11RenderTargetView,
 
@@ -117,6 +131,10 @@ struct CachedCursor {
     /// The texture itself, sized to fit the current shape.
     _texture: ID3D11Texture2D,
     srv: ID3D11ShaderResourceView,
+    /// The XOR sprite (`CursorShape::invert`), `None` when the shape has no
+    /// XOR pixel — the colour cursor never does, and the pass is skipped.
+    _invert_texture: Option<ID3D11Texture2D>,
+    invert_srv: Option<ID3D11ShaderResourceView>,
 }
 
 // SAFETY: like the rest of the engine, the blitter lives on the single
@@ -242,6 +260,27 @@ impl CursorBlitter {
         }
         let blend_state = blend_state.ok_or(EngineError::NotInitialized)?;
 
+        // Blend for the XOR pass: out = src * (1 - dest) + dest * (1 - src).
+        // src 1 → 1 - dest (invert), src 0 → dest (untouched). Alpha of the
+        // target is kept as it is.
+        let mut invert_desc = D3D11_BLEND_DESC::default();
+        invert_desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            SrcBlend: D3D11_BLEND_INV_DEST_COLOR,
+            DestBlend: D3D11_BLEND_INV_SRC_COLOR,
+            BlendOp: D3D11_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D11_BLEND_ZERO,
+            DestBlendAlpha: D3D11_BLEND_ONE,
+            BlendOpAlpha: D3D11_BLEND_OP_ADD,
+            RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+        };
+        let mut invert_blend_state: Option<ID3D11BlendState> = None;
+        unsafe {
+            ctx.device
+                .CreateBlendState(&invert_desc, Some(&mut invert_blend_state))?;
+        }
+        let invert_blend_state = invert_blend_state.ok_or(EngineError::NotInitialized)?;
+
         // Rasterizer: cull none (4-vert strip can wind either way), no
         // scissor (we clip in CPU before computing verts).
         let raster_desc = D3D11_RASTERIZER_DESC {
@@ -287,24 +326,24 @@ impl CursorBlitter {
             vertex_buffer,
             sampler,
             blend_state,
+            invert_blend_state,
             rasterizer,
             target_rtv,
             cursor: None,
         })
     }
 
-    /// Replace the cached cursor sprite with `shape`. Allocates a fresh
-    /// BGRA texture sized to the shape and uploads the pixels in one
-    /// `UpdateSubresource` call. Returns the new generation counter so
-    /// callers can invalidate any draw-side state if needed (today the
-    /// pipeline doesn't track this — every `composite()` references the
-    /// current cached texture).
-    pub fn update_shape(&mut self, ctx: &D3d11Context, shape: &CursorShape) -> EngineResult<u64> {
-        let next_gen = self.cursor.as_ref().map(|c| c.generation + 1).unwrap_or(1);
-        let row_pitch = shape.width * 4;
+    /// One `width x height` BGRA texture + its SRV, filled from `pixels`
+    /// (tightly packed, pitch = width * 4).
+    fn make_sprite(
+        ctx: &D3d11Context,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> EngineResult<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
         let desc = D3D11_TEXTURE2D_DESC {
-            Width: shape.width,
-            Height: shape.height,
+            Width: width,
+            Height: height,
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -318,8 +357,8 @@ impl CursorBlitter {
             MiscFlags: 0,
         };
         let init = D3D11_SUBRESOURCE_DATA {
-            pSysMem: shape.pixels.as_ptr() as *const _,
-            SysMemPitch: row_pitch,
+            pSysMem: pixels.as_ptr() as *const _,
+            SysMemPitch: width * 4,
             SysMemSlicePitch: 0,
         };
         let mut tex: Option<ID3D11Texture2D> = None;
@@ -334,12 +373,32 @@ impl CursorBlitter {
                 .CreateShaderResourceView(&tex, None, Some(&mut srv))?;
         }
         let srv = srv.ok_or(EngineError::NotInitialized)?;
+        Ok((tex, srv))
+    }
+
+    /// Replace the cached cursor sprite with `shape`. Allocates a fresh
+    /// BGRA texture sized to the shape and uploads the pixels in one
+    /// `UpdateSubresource` call. Returns the new generation counter so
+    /// callers can invalidate any draw-side state if needed (today the
+    /// pipeline doesn't track this — every `composite()` references the
+    /// current cached texture).
+    pub fn update_shape(&mut self, ctx: &D3d11Context, shape: &CursorShape) -> EngineResult<u64> {
+        let next_gen = self.cursor.as_ref().map(|c| c.generation + 1).unwrap_or(1);
+        let (tex, srv) = Self::make_sprite(ctx, shape.width, shape.height, &shape.pixels)?;
+        let (invert_tex, invert_srv) = if shape.has_invert {
+            let (t, s) = Self::make_sprite(ctx, shape.width, shape.height, &shape.invert)?;
+            (Some(t), Some(s))
+        } else {
+            (None, None)
+        };
         self.cursor = Some(CachedCursor {
             width: shape.width,
             height: shape.height,
             generation: next_gen,
             _texture: tex,
             srv,
+            _invert_texture: invert_tex,
+            invert_srv,
         });
         let _ = D3D11_BIND_RENDER_TARGET; // silence unused (kept for symmetry)
         Ok(next_gen)
@@ -459,6 +518,19 @@ impl CursorBlitter {
                 .PSSetShaderResources(0, Some(&srv_array));
             ctx.immediate_context.PSSetSamplers(0, Some(&samp_array));
             ctx.immediate_context.Draw(4, 0);
+
+            // XOR pass: the same quad, the XOR sprite, the inverting blend.
+            if let Some(invert_srv) = cursor.invert_srv.as_ref() {
+                let invert_array = [Some(invert_srv.clone())];
+                ctx.immediate_context.OMSetBlendState(
+                    &self.invert_blend_state,
+                    Some(&[1.0, 1.0, 1.0, 1.0]),
+                    0xFFFFFFFF,
+                );
+                ctx.immediate_context
+                    .PSSetShaderResources(0, Some(&invert_array));
+                ctx.immediate_context.Draw(4, 0);
+            }
 
             // Unbind the SRV so the same texture can be re-used as an RTV
             // later if needed (defensive; we only ever use it as SRV).

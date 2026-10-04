@@ -9,13 +9,19 @@
 //!     alpha, copied through.
 //!   - `DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR` (0x4): legacy XOR/key
 //!     format. Pixels with alpha=0x00 are opaque (BGR shown as-is, alpha
-//!     forced to 0xFF). Pixels with alpha=0xFF are XOR-with-screen and we
-//!     render them transparent — losing the overlay effect (rare in modern
-//!     cursors) but keeping the silhouette right.
+//!     forced to 0xFF). Pixels with alpha=0xFF are XOR-with-screen: they go
+//!     into the `invert` sprite with their BGR as the XOR colour.
 //!   - `DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME` (0x1): 1bpp AND mask
 //!     stacked on top of 1bpp XOR mask. The DXGI buffer's effective image
-//!     height is `info.Height / 2` (the lower half is the XOR mask). Same
-//!     XOR caveat as above — XORed pixels render transparent.
+//!     height is `info.Height / 2` (the lower half is the XOR mask).
+//!     AND=1, XOR=1 pixels invert the screen: they go into `invert` as
+//!     white.
+//!
+//! XOR pixels used to be rendered transparent. The Windows I-beam is made
+//! of nothing but XOR pixels, so the text cursor was invisible on the
+//! tablet (2026-10-04, "the mouse disappears when I drag it to the search
+//! bar"). `cursor_blit.rs` draws `invert` in a second pass with an
+//! inverting blend.
 
 use crate::error::EngineResult;
 
@@ -56,6 +62,20 @@ pub struct CursorShape {
     pub hot_y: i32,
     /// Tightly-packed BGRA (B, G, R, A) bytes, premultiplied alpha.
     pub pixels: Vec<u8>,
+    /// The XOR sprite, same size and packing as `pixels`: a pixel that
+    /// XORs the screen carries its XOR colour with alpha 0xFF (white for a
+    /// monochrome cursor), every other pixel is all zero. The blitter draws
+    /// it with an inverting blend, so 0xFF channels invert the backdrop and
+    /// 0x00 channels leave it alone. Empty when `has_invert` is false.
+    pub invert: Vec<u8>,
+    /// `true` iff at least one pixel XORs the screen; a colour cursor never
+    /// does and the blitter skips the pass.
+    pub has_invert: bool,
+}
+
+/// All-zero XOR sprite for a shape without XOR pixels.
+fn no_invert() -> (Vec<u8>, bool) {
+    (Vec::new(), false)
 }
 
 /// Decode one DDA shape buffer into `CursorShape`.
@@ -111,6 +131,7 @@ fn decode_color(
             .ok_or_else(|| short_buffer_err(raw.len(), off + row_bytes))?;
         pixels.extend_from_slice(&raw[off..end]);
     }
+    let (invert, has_invert) = no_invert();
     Ok(CursorShape {
         kind: ShapeKind::Color,
         width,
@@ -118,6 +139,8 @@ fn decode_color(
         hot_x,
         hot_y,
         pixels,
+        invert,
+        has_invert,
     })
 }
 
@@ -132,6 +155,8 @@ fn decode_masked_color(
     let row_bytes = (width as usize) * 4;
     let pitch = pitch as usize;
     let mut pixels = Vec::with_capacity(row_bytes * height as usize);
+    let mut invert = vec![0u8; row_bytes * height as usize];
+    let mut has_invert = false;
     for y in 0..height as usize {
         let off = y * pitch;
         let end = off
@@ -139,17 +164,26 @@ fn decode_masked_color(
             .filter(|e| *e <= raw.len())
             .ok_or_else(|| short_buffer_err(raw.len(), off + row_bytes))?;
         let row = &raw[off..end];
-        for chunk in row.chunks_exact(4) {
+        for (x, chunk) in row.chunks_exact(4).enumerate() {
             let (b, g, r, a) = (chunk[0], chunk[1], chunk[2], chunk[3]);
             // alpha=0x00: opaque, draw the BGR with full opacity.
-            // alpha=0xFF: XOR with screen — we approximate as transparent.
+            // alpha=0xFF: XOR with screen — the BGR is the XOR colour, drawn
+            // by the invert pass; transparent in the colour sprite.
             // PMA: opaque pixels become (B, G, R, 255).
             if a == 0x00 {
                 pixels.extend_from_slice(&[b, g, r, 0xFF]);
             } else {
                 pixels.extend_from_slice(&[0, 0, 0, 0]);
+                if (b, g, r) != (0, 0, 0) {
+                    let i = (y * width as usize + x) * 4;
+                    invert[i..i + 4].copy_from_slice(&[b, g, r, 0xFF]);
+                    has_invert = true;
+                }
             }
         }
+    }
+    if !has_invert {
+        invert.clear();
     }
     Ok(CursorShape {
         kind: ShapeKind::MaskedColor,
@@ -158,6 +192,8 @@ fn decode_masked_color(
         hot_x,
         hot_y,
         pixels,
+        invert,
+        has_invert,
     })
 }
 
@@ -182,7 +218,10 @@ fn decode_monochrome(
     if raw.len() < xor_off * 2 {
         return Err(short_buffer_err(raw.len(), xor_off * 2));
     }
-    let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    let n = (width as usize) * (height as usize) * 4;
+    let mut pixels = Vec::with_capacity(n);
+    let mut invert = vec![0u8; n];
+    let mut has_invert = false;
     for y in 0..height as usize {
         for x in 0..width as usize {
             let byte_idx = x / 8;
@@ -190,19 +229,27 @@ fn decode_monochrome(
             let mask = 1u8 << bit_idx;
             let and_bit = (raw[y * pitch + byte_idx] & mask) != 0;
             let xor_bit = (raw[xor_off + y * pitch + byte_idx] & mask) != 0;
-            // Mapping (matches GDI semantics, with XOR=transparent fallback):
+            // Mapping (GDI semantics):
             //   AND=0, XOR=0 → black, opaque
             //   AND=0, XOR=1 → white, opaque
             //   AND=1, XOR=0 → transparent (background)
-            //   AND=1, XOR=1 → XOR with screen (we render transparent v1)
+            //   AND=1, XOR=1 → invert the screen (the I-beam is all of these)
             let bgra = match (and_bit, xor_bit) {
                 (false, false) => [0, 0, 0, 0xFF],
                 (false, true) => [0xFF, 0xFF, 0xFF, 0xFF],
                 (true, false) => [0, 0, 0, 0],
-                (true, true) => [0, 0, 0, 0],
+                (true, true) => {
+                    let i = (y * width as usize + x) * 4;
+                    invert[i..i + 4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+                    has_invert = true;
+                    [0, 0, 0, 0]
+                }
             };
             pixels.extend_from_slice(&bgra);
         }
+    }
+    if !has_invert {
+        invert.clear();
     }
     Ok(CursorShape {
         kind: ShapeKind::Monochrome,
@@ -211,6 +258,8 @@ fn decode_monochrome(
         hot_x,
         hot_y,
         pixels,
+        invert,
+        has_invert,
     })
 }
 
@@ -234,6 +283,8 @@ mod tests {
         ];
         let shape = decode_shape(2, 2, 2, 12, 0, 0, &raw).unwrap();
         assert_eq!(shape.pixels.len(), 16);
+        assert!(!shape.has_invert);
+        assert!(shape.invert.is_empty());
         assert_eq!(&shape.pixels[..4], &[0xAA, 0xBB, 0xCC, 0xFF]);
         assert_eq!(&shape.pixels[4..8], &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&shape.pixels[8..12], &[0x44, 0x55, 0x66, 0xFF]);
@@ -246,10 +297,40 @@ mod tests {
         let raw = [0x00, 0x00, 0xFF, 0x00];
         let shape = decode_shape(4, 1, 1, 4, 0, 0, &raw).unwrap();
         assert_eq!(&shape.pixels, &[0x00, 0x00, 0xFF, 0xFF]);
-        // 1×1 with alpha=0xFF → transparent (XOR fallback).
+        assert!(!shape.has_invert);
+        // 1×1 with alpha=0xFF → XOR with the screen: transparent in the
+        // colour sprite, the BGR as the XOR colour in the invert sprite.
         let raw = [0x00, 0x00, 0xFF, 0xFF];
         let shape = decode_shape(4, 1, 1, 4, 0, 0, &raw).unwrap();
         assert_eq!(&shape.pixels, &[0, 0, 0, 0]);
+        assert!(shape.has_invert);
+        assert_eq!(&shape.invert, &[0x00, 0x00, 0xFF, 0xFF]);
+        // XOR with black changes nothing: no invert pass for it.
+        let raw = [0x00, 0x00, 0x00, 0xFF];
+        let shape = decode_shape(4, 1, 1, 4, 0, 0, &raw).unwrap();
+        assert!(!shape.has_invert);
+    }
+
+    /// The I-beam: AND=1 and XOR=1 on every pixel of its stem. It used to
+    /// decode to all-transparent, an invisible text cursor on the tablet.
+    #[test]
+    fn decode_monochrome_xor_pixels_invert_the_screen() {
+        // 8×2 image. Row 0: AND=1 XOR=1 everywhere → invert. Row 1: AND=1
+        // XOR=0 → transparent. Pitch = 1 byte.
+        let raw = [
+            0xFF, 0xFF, // AND rows
+            0xFF, 0x00, // XOR rows
+        ];
+        let shape = decode_shape(1, 8, 4, 1, 0, 0, &raw).unwrap();
+        assert_eq!(shape.height, 2);
+        assert!(shape.has_invert);
+        assert_eq!(shape.invert.len(), shape.pixels.len());
+        // Row 0: colour sprite transparent, invert sprite white.
+        assert!(shape.pixels[..32].iter().all(|&b| b == 0));
+        assert!(shape.invert[..32].iter().all(|&b| b == 0xFF));
+        // Row 1: both transparent.
+        assert!(shape.pixels[32..].iter().all(|&b| b == 0));
+        assert!(shape.invert[32..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -264,6 +345,8 @@ mod tests {
         ];
         let shape = decode_shape(1, 8, 8, 1, 0, 0, &raw).unwrap();
         assert_eq!(shape.height, 4);
+        // AND=0 everywhere in row 0, AND=0 XOR=0 below: no XOR pixel.
+        assert!(!shape.has_invert);
         // Row 0: 4 white, 4 black, all opaque
         assert_eq!(&shape.pixels[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
         assert_eq!(&shape.pixels[12..16], &[0xFF, 0xFF, 0xFF, 0xFF]);
